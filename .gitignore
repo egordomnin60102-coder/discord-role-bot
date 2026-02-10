@@ -1,4 +1,53 @@
+# Общие
 bin/
 obj/
-*.log
+.vscode/
+.vs/
+.DS_Store
+Thumbs.db
+
+# .NET
+*.swp
+*.*~
+project.lock.json
+*.nupkg
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Пакеты
+packages/
+**/packages/*
+
+# Результаты сборки
+[Bb]uild/
+[Bb]uilds/
+out/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+
+# Секреты
+appsettings.*.json
+secrets.json
 config.json
+.env
+*.pem
+*.key
+
+# Базы данных
+*.db
+*.sqlite
+*.mdf
+*.ldf
+
+# Логи
+*.log
+logs/
+
+# Временные файлы
+tmp/
+temp/
