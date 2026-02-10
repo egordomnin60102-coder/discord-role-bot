@@ -1,0 +1,83 @@
+name: Discord Bot CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'  # Каждые 6 часов
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+      
+    - name: ⚙️ Setup .NET 8
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+        
+    - name: 📦 Restore dependencies
+      run: |
+        cd bot
+        dotnet restore
+        
+    - name: 🏗️ Build project
+      run: |
+        cd bot
+        dotnet build -c Release --no-restore
+        
+    - name: 🧪 Run tests
+      run: |
+        echo "✅ Build successful!"
+        # Здесь можно добавить тесты
+        
+    - name: 📤 Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: discord-bot
+        path: bot/bin/Release/net8.0/
+        retention-days: 7
+
+  deploy:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    
+    steps:
+    - name: 📥 Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: discord-bot
+        path: bot
+        
+    - name: 🤖 Run Discord Bot
+      env:
+        DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+      run: |
+        echo "🚀 Запуск Discord Bot..."
+        cd bot
+        
+        # Создаем файл с токеном если нужно
+        if [ -n "$DISCORD_TOKEN" ]; then
+          echo "✅ Токен установлен"
+        else
+          echo "❌ Токен не найден!"
+          exit 1
+        fi
+        
+        # Запускаем бота на 6 часов
+        echo "⏰ Бот запущен на 6 часов..."
+        timeout 360m dotnet ./bot.dll || echo "🛑 Бот остановлен"
+        
+        echo "🔄 Перезапуск..."
+        
+    - name: 📊 Send notification
+      if: always()
+      run: |
+        echo "📨 Workflow завершен: ${{ job.status }}"
