@@ -1,62 +1,21 @@
 using Discord;
+using Discord.Interactions;
 using Discord.WebSocket;
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Text.Json;
-using System.Threading;
-using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using System.Reflection;
 
 public class Program
 {
-    private readonly DiscordSocketClient _client;
-    private readonly InteractionService _interactions;
-    private readonly IServiceProvider _services;
-    private readonly ILogger _logger;
+    private static DiscordSocketClient _client;
+    private static InteractionService _interactions;
+    private static IServiceProvider _services;
+    private static ILogger _logger;
 
-    public static async Task Main() => await new Program().RunAsync();
-
-    public Program()
+    public static async Task Main()
     {
-        _client = new DiscordSocketClient(new DiscordSocketConfig
-        {
-            GatewayIntents = GatewayIntents.All,
-            LogLevel = LogSeverity.Info
-        });
-
-        _interactions = new InteractionService(_client.Rest, new InteractionServiceConfig
-        {
-            LogLevel = LogSeverity.Info,
-            UseCompiledLambda = true
-        });
-
-        _services = ConfigureServices();
-        _logger = _services.GetRequiredService<ILogger<Program>>();
-    }
-
-    private IServiceProvider ConfigureServices()
-    {
-        var services = new ServiceCollection()
-            .AddSingleton(_client)
-            .AddSingleton(_interactions)
-            .AddLogging(builder => builder.AddConsole().SetMinimumLevel(LogLevel.Information))
-            .AddSingleton<MusicService>()
-            .AddSingleton<LoggingService>();
-
-        return services.BuildServiceProvider();
-    }
-
-    private async Task RunAsync()
-    {
-        Console.Title = "Universal Discord Bot";
-        Console.OutputEncoding = System.Text.Encoding.UTF8;
-
-        Console.WriteLine("========================================");
-        Console.WriteLine("       UNIVERSAL DISCORD BOT v2.0");
-        Console.WriteLine("========================================");
-        Console.WriteLine();
-
+        Console.WriteLine("🤖 Starting Discord Bot with Slash Commands...");
+        
         var token = Environment.GetEnvironmentVariable("DISCORD_TOKEN");
         if (string.IsNullOrEmpty(token))
         {
@@ -64,83 +23,98 @@ public class Program
             return;
         }
 
-        await InitializeAsync();
+        // Настройка сервисов
+        _services = ConfigureServices();
+        _logger = _services.GetRequiredService<ILogger<Program>>();
+        
+        // Создание клиента
+        _client = new DiscordSocketClient(new DiscordSocketConfig
+        {
+            GatewayIntents = GatewayIntents.All,
+            LogLevel = LogSeverity.Info
+        });
+
+        // Настройка InteractionService
+        _interactions = new InteractionService(_client.Rest, new InteractionServiceConfig
+        {
+            LogLevel = LogSeverity.Info,
+            DefaultRunMode = RunMode.Async
+        });
+
+        // Регистрация обработчиков
+        _client.Log += LogAsync;
+        _client.Ready += ReadyAsync;
+        _client.InteractionCreated += HandleInteractionAsync;
+
+        // Регистрация модулей команд
+        await _interactions.AddModulesAsync(Assembly.GetEntryAssembly(), _services);
+
+        // Подключение к Discord
         await _client.LoginAsync(TokenType.Bot, token);
         await _client.StartAsync();
 
-        await Task.Delay(-1);
+        Console.WriteLine("✅ Bot started! Waiting for commands...");
+        await Task.Delay(-1); // Бесконечное ожидание
     }
 
-    private async Task InitializeAsync()
+    private static IServiceProvider ConfigureServices()
     {
-        _client.Log += LogAsync;
-        _client.Ready += ReadyAsync;
-        _client.InteractionCreated += InteractionCreatedAsync;
-        _client.UserJoined += UserJoinedAsync;
-
-        await _interactions.AddModulesAsync(Assembly.GetEntryAssembly(), _services);
+        return new ServiceCollection()
+            .AddLogging(builder =>
+            {
+                builder.AddConsole();
+                builder.SetMinimumLevel(LogLevel.Information);
+            })
+            .BuildServiceProvider();
     }
 
-    private async Task ReadyAsync()
+    private static async Task ReadyAsync()
     {
-        Console.WriteLine($"✅ Bot {_client.CurrentUser} ready!");
-        Console.WriteLine($"🏰 Guilds: {_client.Guilds.Count}");
-
-        // Регистрируем slash-команды глобально
+        Console.WriteLine($"✅ Bot {_client.CurrentUser} is ready!");
+        
         try
         {
+            // Регистрация slash-команд
             await _interactions.RegisterCommandsGloballyAsync();
-            Console.WriteLine("✅ Slash commands registered globally!");
+            Console.WriteLine("✅ Slash commands registered!");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"⚠️ Error registering commands: {ex.Message}");
+            Console.WriteLine($"❌ Error registering commands: {ex.Message}");
         }
 
-        await _client.SetActivityAsync(new Game("/help for commands", ActivityType.Listening));
+        await _client.SetActivityAsync(new Game("/help", ActivityType.Listening));
     }
 
-    private async Task InteractionCreatedAsync(SocketInteraction interaction)
+    private static async Task HandleInteractionAsync(SocketInteraction interaction)
     {
         try
         {
             var context = new SocketInteractionContext(_client, interaction);
-            await _interactions.ExecuteCommandAsync(context, _services);
+            var result = await _interactions.ExecuteCommandAsync(context, _services);
+            
+            if (!result.IsSuccess)
+            {
+                Console.WriteLine($"❌ Command error: {result.ErrorReason}");
+                
+                if (interaction.Type == InteractionType.ApplicationCommand)
+                {
+                    await interaction.RespondAsync($"❌ Error: {result.ErrorReason}", ephemeral: true);
+                }
+            }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"❌ Command error: {ex.Message}");
+            Console.WriteLine($"❌ Exception: {ex.Message}");
             
             if (interaction.Type == InteractionType.ApplicationCommand)
             {
-                await interaction.GetOriginalResponseAsync()
-                    .ContinueWith(async msg => await msg.Result.DeleteAsync());
+                await interaction.RespondAsync($"❌ An error occurred: {ex.Message}", ephemeral: true);
             }
         }
     }
 
-    private async Task UserJoinedAsync(SocketGuildUser user)
-    {
-        // Автоматическая выдача роли
-        var role = user.Guild.Roles.FirstOrDefault(r => 
-            r.Name.Contains("Member", StringComparison.OrdinalIgnoreCase) && !r.IsEveryone);
-        
-        if (role != null)
-        {
-            try
-            {
-                await user.AddRoleAsync(role);
-                Console.WriteLine($"✅ Role {role.Name} given to {user.Username}");
-                
-                var channel = user.Guild.SystemChannel;
-                if (channel != null)
-                    await channel.SendMessageAsync($"👋 Welcome {user.Mention}! You got {role.Mention}");
-            }
-            catch { }
-        }
-    }
-
-    private Task LogAsync(LogMessage msg)
+    private static Task LogAsync(LogMessage msg)
     {
         Console.WriteLine($"[{msg.Severity}] {msg.Message}");
         return Task.CompletedTask;
