@@ -29,7 +29,7 @@ jobs:
     - name: 🔨 Build bot
       run: |
         echo "Building Discord bot..."
-        dotnet build -c Release
+        dotnet build ./bot/bot.csproj -c Release
         
     - name: 🤖 Run Discord Bot
       env:
@@ -38,8 +38,12 @@ jobs:
         echo "🚀 Starting Discord Bot on GitHub Actions..."
         echo "Bot will run for 5 hours 45 minutes (GitHub limit)"
         
-        # Запускаем бота на 5 часов 45 минут
+        # Вариант 1: Запускаем бота из папки проекта
+        cd ./bot
         timeout 345m dotnet run --configuration Release
+        
+        # ИЛИ Вариант 2: Запускаем бота с указанием пути к проекту (раскомментируйте если нужно)
+        # timeout 345m dotnet run --project ./bot/bot.csproj --configuration Release
         
         echo "⏰ Time's up! Bot will restart in 15 minutes via schedule"
         
