@@ -1,13 +1,14 @@
 using Discord;
 using Discord.WebSocket;
+using Discord.Interactions;
 using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Text.RegularExpressions;
+using Microsoft.Extensions.DependencyInjection;
 
-// Класс для предупреждений
 public class Warning
 {
     public string Reason { get; set; } = string.Empty;
@@ -18,6 +19,8 @@ public class Warning
 public class Program
 {
     private static DiscordSocketClient? client;
+    private static InteractionService? interactions;
+    private static IServiceProvider? services;
     private static Dictionary<ulong, Dictionary<ulong, List<Warning>>> userWarnings = new();
     private static Dictionary<string, Timer> activeTimers = new();
 
@@ -29,7 +32,6 @@ public class Program
         Console.WriteLine("🤖 Discord Moderation Bot - Auto Role + Moderation");
         Console.WriteLine("==================================================");
 
-        // Получаем токен
         var token = Environment.GetEnvironmentVariable("DISCORD_TOKEN");
         if (string.IsNullOrEmpty(token))
         {
@@ -45,20 +47,28 @@ public class Program
             GatewayIntents = GatewayIntents.Guilds |
                            GatewayIntents.GuildMembers |
                            GatewayIntents.GuildMessages |
-                           GatewayIntents.GuildVoiceStates,
+                           GatewayIntents.GuildVoiceStates |
+                           GatewayIntents.MessageContent,
             LogLevel = LogSeverity.Info
         });
 
-        // Логирование
+        interactions = new InteractionService(client, new InteractionServiceConfig
+        {
+            DefaultRunMode = RunMode.Async,
+            LogLevel = LogSeverity.Info
+        });
+
+        services = new ServiceCollection()
+            .AddSingleton(client)
+            .AddSingleton(interactions)
+            .AddSingleton<CommandHandler>()
+            .BuildServiceProvider();
+
         client.Log += LogMessage;
-
-        // Когда бот готов
         client.Ready += ReadyAsync;
-
-        // ⭐⭐⭐ ГЛАВНОЕ: ВЫДАЧА РОЛИ НОВЫМ УЧАСТНИКАМ ⭐⭐⭐
         client.UserJoined += UserJoinedAsync;
-
-        // События для логирования
+        
+        // Модерационные события
         client.UserBanned += UserBannedAsync;
         client.UserUnbanned += UserUnbannedAsync;
         client.UserLeft += UserLeftAsync;
@@ -67,10 +77,8 @@ public class Program
         client.RoleDeleted += RoleDeletedAsync;
         client.UserUpdated += UserUpdatedAsync;
 
-        // Команды для управления
-        client.MessageReceived += MessageReceivedAsync;
+        await services.GetRequiredService<CommandHandler>().InitializeAsync();
 
-        // Подключаемся
         await client.LoginAsync(TokenType.Bot, token);
         await client.StartAsync();
 
@@ -80,7 +88,6 @@ public class Program
         Console.WriteLine("📊 Logging: ENABLED");
         Console.WriteLine("⏰ Will run for 5h45m, then auto-restart");
 
-        // Бесконечное ожидание
         await Task.Delay(-1);
     }
 
@@ -90,19 +97,22 @@ public class Program
         return Task.CompletedTask;
     }
 
-    private static Task ReadyAsync()
+    private static async Task ReadyAsync()
     {
-        if (client == null) return Task.CompletedTask;
+        if (client == null || interactions == null) return;
         
         Console.WriteLine($"\n🎉 BOT READY: {client.CurrentUser}");
         Console.WriteLine($"🏰 Servers: {client.Guilds.Count}");
+
+        // Регистрируем команды глобально
+        await interactions.RegisterCommandsGloballyAsync();
+        Console.WriteLine("✅ Slash commands registered globally!");
 
         foreach (var guild in client.Guilds)
         {
             Console.WriteLine($"   • {guild.Name} (ID: {guild.Id})");
             Console.WriteLine($"     Members: {guild.MemberCount}, Roles: {guild.Roles.Count}");
 
-            // Инициализируем словарь предупреждений для сервера
             if (!userWarnings.ContainsKey(guild.Id))
             {
                 userWarnings[guild.Id] = new Dictionary<ulong, List<Warning>>();
@@ -110,77 +120,36 @@ public class Program
         }
 
         Console.WriteLine("===========================================");
-        return Task.CompletedTask;
     }
 
+    // === АВТОВЫДАЧА РОЛИ ===
     private static async Task UserJoinedAsync(SocketGuildUser user)
     {
         Console.WriteLine($"\n[🎉] NEW USER: {user.Username} joined {user.Guild.Name}");
-
+        
         try
         {
-            // 1. Ищем роль "Member" или "Участник" или "Новичок"
             var role = FindRoleForUser(user.Guild);
-
             if (role == null)
             {
                 Console.WriteLine($"   ⚠️ No suitable role found on {user.Guild.Name}");
-                Console.WriteLine($"   Available roles:");
-                foreach (var r in user.Guild.Roles.Where(r => !r.IsEveryone).Take(5))
-                {
-                    Console.WriteLine($"     • {r.Name} (ID: {r.Id})");
-                }
                 return;
             }
 
-            Console.WriteLine($"   🎯 Found role: {role.Name} (ID: {role.Id})");
-
-            // 2. Проверяем права бота
             var botUser = user.Guild.CurrentUser;
             if (botUser == null || !botUser.GuildPermissions.ManageRoles)
             {
-                Console.WriteLine($"   ❌ Bot doesn't have 'Manage Roles' permission on {user.Guild.Name}");
+                Console.WriteLine($"   ❌ Bot doesn't have 'Manage Roles' permission");
                 return;
             }
 
-            // 3. Проверяем иерархию ролей
-            var highestBotRole = botUser.Roles.OrderByDescending(r => r.Position).FirstOrDefault();
-            if (highestBotRole == null || highestBotRole.Position <= role.Position)
-            {
-                Console.WriteLine($"   ❌ Bot role ({highestBotRole?.Name}) must be HIGHER than {role.Name}");
-                Console.WriteLine($"      Bot role position: {highestBotRole?.Position}");
-                Console.WriteLine($"      Target role position: {role.Position}");
-                return;
-            }
-
-            // 4. Проверяем, есть ли уже эта роль
-            if (user.Roles.Any(r => r.Id == role.Id))
-            {
-                Console.WriteLine($"   ℹ️ User already has role {role.Name}");
-                return;
-            }
-
-            // 5. ВЫДАЁМ РОЛЬ! 🎉
-            Console.WriteLine($"   ⚡ Assigning role {role.Name} to {user.Username}...");
             await user.AddRoleAsync(role);
             Console.WriteLine($"   ✅ SUCCESS: Role {role.Name} assigned to {user.Username}!");
-
-            // 6. Отправляем приветствие
             await SendWelcomeMessage(user, role);
-
-            // 7. Логируем в лог-канал
             await LogToModChannel(user.Guild,
                 $"🎉 **Новый участник**\n" +
-                $"👤 Пользователь: {user.Mention} (`{user.Username}`)\n" +
-                $"🎭 Получена роль: {role.Mention}\n" +
-                $"📅 Время: {DateTime.Now:dd.MM.yyyy HH:mm}");
-
-        }
-        catch (Discord.Net.HttpException ex) when (ex.DiscordCode == DiscordErrorCode.MissingPermissions)
-        {
-            Console.WriteLine($"   ❌ PERMISSION ERROR: {ex.Message}");
-            Console.WriteLine($"   Fix: 1) Give bot 'Manage Roles' permission");
-            Console.WriteLine($"        2) Make bot role higher than target role");
+                $"👤 Пользователь: {user.Mention}\n" +
+                $"🎭 Получена роль: {role.Mention}");
         }
         catch (Exception ex)
         {
@@ -188,1015 +157,597 @@ public class Program
         }
     }
 
-    private static async Task UserBannedAsync(SocketUser user, SocketGuild guild)
+    // === МОДЕРАЦИОННЫЕ КОМАНДЫ ===
+    public class CommandHandler : InteractionModuleBase<SocketInteractionContext>
     {
-        await LogToModChannel(guild,
-            $"🔨 **Пользователь забанен**\n" +
-            $"👤 Пользователь: `{user.Username}`\n" +
-            $"🆔 ID: `{user.Id}`\n" +
-            $"📅 Время: {DateTime.Now:dd.MM.yyyy HH:mm}");
-    }
-
-    private static async Task UserUnbannedAsync(SocketUser user, SocketGuild guild)
-    {
-        await LogToModChannel(guild,
-            $"🔓 **Пользователь разбанен**\n" +
-            $"👤 Пользователь: `{user.Username}`\n" +
-            $"🆔 ID: `{user.Id}`\n" +
-            $"📅 Время: {DateTime.Now:dd.MM.yyyy HH:mm}");
-    }
-
-    private static async Task UserLeftAsync(SocketGuild guild, SocketUser user)
-    {
-        await LogToModChannel(guild,
-            $"🚪 **Пользователь покинул сервер**\n" +
-            $"👤 Пользователь: `{user.Username}`\n" +
-            $"🆔 ID: `{user.Id}`\n" +
-            $"📅 Время: {DateTime.Now:dd.MM.yyyy HH:mm}");
-    }
-
-    private static async Task UserVoiceStateUpdatedAsync(SocketUser user, SocketVoiceState oldState, SocketVoiceState newState)
-    {
-        if (user is SocketGuildUser guildUser)
+        [SlashCommand("help", "Показать список всех команд")]
+        public async Task HelpCommand()
         {
-            var guild = guildUser.Guild;
-            if (oldState.VoiceChannel == null && newState.VoiceChannel != null)
-            {
-                await LogToModChannel(guild,
-                    $"🎤 **Пользователь зашел в голосовой канал**\n" +
-                    $"👤 Пользователь: {guildUser.Mention}\n" +
-                    $"📢 Канал: {newState.VoiceChannel.Name}\n" +
-                    $"📅 Время: {DateTime.Now:HH:mm}");
-            }
-            else if (oldState.VoiceChannel != null && newState.VoiceChannel == null)
-            {
-                await LogToModChannel(guild,
-                    $"🔇 **Пользователь вышел из голосового канала**\n" +
-                    $"👤 Пользователь: {guildUser.Mention}\n" +
-                    $"📢 Канал: {oldState.VoiceChannel.Name}\n" +
-                    $"📅 Время: {DateTime.Now:HH:mm}");
-            }
-            else if (oldState.VoiceChannel != null && newState.VoiceChannel != null && oldState.VoiceChannel.Id != newState.VoiceChannel.Id)
-            {
-                await LogToModChannel(guild,
-                    $"🔄 **Пользователь перешел в другой голосовой канал**\n" +
-                    $"👤 Пользователь: {guildUser.Mention}\n" +
-                    $"📢 С: {oldState.VoiceChannel.Name}\n" +
-                    $"📢 На: {newState.VoiceChannel.Name}\n" +
-                    $"📅 Время: {DateTime.Now:HH:mm}");
-            }
+            var embed = new EmbedBuilder()
+                .WithTitle("🤖 Moderation Bot - Все команды")
+                .WithDescription("**Префикс:** `/` (слеш-команды)")
+                .WithColor(Color.Blue)
+                .AddField("🛡️ **Модерация**", 
+                    "`/tempmute` - Временный мут\n" +
+                    "`/tempban` - Временный бан\n" +
+                    "`/mute` - Замутить\n" +
+                    "`/unmute` - Размутить\n" +
+                    "`/kick` - Кикнуть\n" +
+                    "`/ban` - Забанить\n" +
+                    "`/unban` - Разбанить\n" +
+                    "`/clear` - Очистить сообщения", true)
+                .AddField("⚠️ **Предупреждения**", 
+                    "`/warn` - Выдать варн\n" +
+                    "`/warnings` - Список варнов\n" +
+                    "`/removewarn` - Удалить варн\n" +
+                    "`/modstats` - Статистика", true)
+                .AddField("⚙️ **Настройки**", 
+                    "`/setrole` - Настройка роли\n" +
+                    "`/roleinfo` - Инфо о роли\n" +
+                    "`/modlog` - Лог-канал\n" +
+                    "`/ping` - Проверка бота", true)
+                .AddField("🎯 **Авто-функции**",
+                    "• Автовыдача роли новичкам\n" +
+                    "• Логирование всех действий\n" +
+                    "• 3 варна = мут 1ч\n" +
+                    "• 5 варнов = бан", false)
+                .WithFooter($"Серверов: {client?.Guilds.Count ?? 0} • Хостинг: GitHub Actions")
+                .WithCurrentTimestamp()
+                .Build();
+
+            await RespondAsync(embed: embed, ephemeral: true);
         }
-    }
 
-    private static async Task RoleCreatedAsync(SocketRole role)
-    {
-        await LogToModChannel(role.Guild,
-            $"🆕 **Создана новая роль**\n" +
-            $"🎭 Роль: {role.Mention}\n" +
-            $"🎨 Цвет: {role.Color}\n" +
-            $"📅 Время: {DateTime.Now:dd.MM.yyyy HH:mm}");
-    }
-
-    private static async Task RoleDeletedAsync(SocketRole role)
-    {
-        await LogToModChannel(role.Guild,
-            $"🗑️ **Роль удалена**\n" +
-            $"🎭 Роль: `{role.Name}`\n" +
-            $"🆔 ID: `{role.Id}`\n" +
-            $"📅 Время: {DateTime.Now:dd.MM.yyyy HH:mm}");
-    }
-
-    private static async Task UserUpdatedAsync(SocketUser oldUser, SocketUser newUser)
-    {
-        if (oldUser is SocketGuildUser oldGuildUser && newUser is SocketGuildUser newGuildUser)
+        [SlashCommand("ping", "Проверка работы бота")]
+        public async Task PingCommand()
         {
-            var guild = newGuildUser.Guild;
+            await RespondAsync($"🏓 **Pong!**\n⚡ Задержка: {Context.Client.Latency}ms", ephemeral: true);
+        }
 
-            // Проверяем изменения в ролях
-            var oldRoles = oldGuildUser.Roles.Select(r => r.Id).ToHashSet();
-            var newRoles = newGuildUser.Roles.Select(r => r.Id).ToHashSet();
-
-            if (!oldRoles.SetEquals(newRoles))
+        [SlashCommand("roleinfo", "Информация о роли для новичков")]
+        public async Task RoleInfoCommand()
+        {
+            var role = FindRoleForUser(Context.Guild);
+            if (role == null)
             {
-                var addedRoles = newRoles.Except(oldRoles).Select(id => guild.GetRole(id)).Where(r => r != null);
-                var removedRoles = oldRoles.Except(newRoles).Select(id => guild.GetRole(id)).Where(r => r != null);
+                await RespondAsync("❌ Не найдена подходящая роль для выдачи.", ephemeral: true);
+                return;
+            }
 
-                foreach (var role in addedRoles)
+            var embed = new EmbedBuilder()
+                .WithTitle("🎯 Роль для новичков")
+                .WithColor(role.Color)
+                .AddField("Роль", role.Mention, true)
+                .AddField("Название", role.Name, true)
+                .AddField("ID", role.Id.ToString(), true)
+                .AddField("Цвет", role.Color.ToString(), true)
+                .AddField("Позиция", role.Position.ToString(), true)
+                .WithFooter("Новые участники получают эту роль автоматически")
+                .Build();
+
+            await RespondAsync(embed: embed);
+        }
+
+        [SlashCommand("setrole", "Информация о настройке роли")]
+        public async Task SetRoleCommand()
+        {
+            var user = Context.User as SocketGuildUser;
+            if (user == null || !user.GuildPermissions.ManageRoles)
+            {
+                await RespondAsync("❌ Нужны права **Manage Roles**!", ephemeral: true);
+                return;
+            }
+
+            await RespondAsync(
+                "⚙️ **Настройка роли:**\n" +
+                "Бот автоматически ищет роли: `Member`, `Участник`, `Новичок`\n" +
+                "Чтобы изменить роль - обновите код в репозитории.", ephemeral: true);
+        }
+
+        [SlashCommand("tempmute", "Временный мут пользователя")]
+        public async Task TempMuteCommand(
+            [Summary("user", "Пользователь")] SocketGuildUser user,
+            [Summary("time", "Время (30s, 5m, 2h, 1d)")] string time,
+            [Summary("reason", "Причина")] string reason = "Не указана")
+        {
+            var author = Context.User as SocketGuildUser;
+            if (author == null || !author.GuildPermissions.MuteMembers)
+            {
+                await RespondAsync("❌ Нужны права **Mute Members**!", ephemeral: true);
+                return;
+            }
+
+            if (user.Id == author.Id)
+            {
+                await RespondAsync("❌ Нельзя замутить себя!", ephemeral: true);
+                return;
+            }
+
+            if (!TryParseTime(time, out var timeSpan))
+            {
+                await RespondAsync("❌ Неверный формат времени! Используйте: 30s, 5m, 2h, 1d", ephemeral: true);
+                return;
+            }
+
+            var muteRole = await GetOrCreateMuteRole(Context.Guild);
+            if (muteRole == null)
+            {
+                await RespondAsync("❌ Не удалось создать/найти роль для мута!", ephemeral: true);
+                return;
+            }
+
+            await user.AddRoleAsync(muteRole);
+
+            var timerKey = $"mute_{Context.Guild.Id}_{user.Id}";
+            var timer = new Timer(async _ =>
+            {
+                try
                 {
-                    await LogToModChannel(guild,
-                        $"➕ **Пользователю добавлена роль**\n" +
-                        $"👤 Пользователь: {newGuildUser.Mention}\n" +
-                        $"🎭 Роль: {role.Mention}\n" +
-                        $"📅 Время: {DateTime.Now:dd.MM.yyyy HH:mm}");
-                }
-
-                foreach (var role in removedRoles)
-                {
-                    await LogToModChannel(guild,
-                        $"➖ **У пользователя удалена роль**\n" +
-                        $"👤 Пользователь: {newGuildUser.Mention}\n" +
-                        $"🎭 Роль: {role.Mention}\n" +
-                        $"📅 Время: {DateTime.Now:dd.MM.yyyy HH:mm}");
-                }
-            }
-        }
-    }
-
-    private static async Task MessageReceivedAsync(SocketMessage message)
-    {
-        if (message.Author.IsBot || message is not SocketUserMessage userMessage)
-            return;
-
-        var guild = (message.Channel as SocketGuildChannel)?.Guild;
-        if (guild == null) return;
-
-        var content = userMessage.Content;
-        var lowerContent = content.ToLower();
-
-        // Обработка слэш-команд и обычных команд
-        if (content.StartsWith("/") || content.StartsWith("!"))
-        {
-            var args = content.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            var command = args[0].ToLower().TrimStart('/', '!');
-
-            switch (command)
-            {
-                case "tempmute":
-                    await HandleTempMute(userMessage, args, guild);
-                    break;
-
-                case "tempban":
-                    await HandleTempBan(userMessage, args, guild);
-                    break;
-
-                case "clear":
-                case "purge":
-                    await HandleClearMessages(userMessage, args, guild);
-                    break;
-
-                case "warn":
-                    await HandleWarn(userMessage, args, guild);
-                    break;
-
-                case "warnings":
-                    await HandleShowWarnings(userMessage, args, guild);
-                    break;
-
-                case "removewarn":
-                    await HandleRemoveWarning(userMessage, args, guild);
-                    break;
-
-                case "kick":
-                    await HandleKick(userMessage, args, guild);
-                    break;
-
-                case "ban":
-                    await HandleBan(userMessage, args, guild);
-                    break;
-
-                case "mute":
-                    await HandleMute(userMessage, args, guild);
-                    break;
-
-                case "unmute":
-                    await HandleUnmute(userMessage, args, guild);
-                    break;
-
-                case "unban":
-                    await HandleUnban(userMessage, args, guild);
-                    break;
-
-                case "setrole":
-                    await HandleSetRole(userMessage, args, guild);
-                    break;
-
-                case "roleinfo":
-                    await HandleRoleInfo(userMessage, guild);
-                    break;
-
-                case "ping":
-                    await HandlePing(userMessage, guild);
-                    break;
-
-                case "help":
-                    await HandleHelp(userMessage, guild);
-                    break;
-
-                case "modlog":
-                    await HandleModLog(userMessage, args, guild);
-                    break;
-
-                case "modstats":
-                    await HandleModStats(userMessage, guild);
-                    break;
-            }
-        }
-    }
-
-    // === ОБРАБОТЧИКИ КОМАНД ===
-
-    private static async Task HandleTempMute(SocketUserMessage message, string[] args, SocketGuild guild)
-    {
-        var author = message.Author as SocketGuildUser;
-        if (author == null || !author.GuildPermissions.MuteMembers)
-        {
-            await message.Channel.SendMessageAsync("❌ Нужны права **Mute Members**!");
-            return;
-        }
-
-        if (args.Length < 3)
-        {
-            await message.Channel.SendMessageAsync(
-                "❌ Использование: `/tempmute @пользователь время причина`\n" +
-                "Пример: `/tempmute @Спамер 30m Реклама`\n" +
-                "Время: 30s, 5m, 2h, 1d");
-            return;
-        }
-
-        var user = await GetUserFromMention(args[1], guild);
-        if (user == null)
-        {
-            await message.Channel.SendMessageAsync("❌ Пользователь не найден!");
-            return;
-        }
-
-        if (user.Id == author.Id)
-        {
-            await message.Channel.SendMessageAsync("❌ Нельзя замутить себя!");
-            return;
-        }
-
-        if (!(author.GuildPermissions.Administrator || author.Hierarchy > user.Hierarchy))
-        {
-            await message.Channel.SendMessageAsync("❌ Нельзя замутить пользователя с равной или более высокой ролью!");
-            return;
-        }
-
-        var timeString = args[2];
-        var reason = args.Length > 3 ? string.Join(" ", args.Skip(3)) : "Не указана";
-
-        if (!TryParseTime(timeString, out var timeSpan))
-        {
-            await message.Channel.SendMessageAsync("❌ Неверный формат времени! Используйте: 30s, 5m, 2h, 1d");
-            return;
-        }
-
-        var muteRole = await GetOrCreateMuteRole(guild);
-        if (muteRole == null)
-        {
-            await message.Channel.SendMessageAsync("❌ Не удалось создать/найти роль для мута!");
-            return;
-        }
-
-        await user.AddRoleAsync(muteRole);
-
-        var timer = new Timer(async _ =>
-        {
-            try
-            {
-                if (user.Roles.Any(r => r.Id == muteRole.Id))
-                {
-                    await user.RemoveRoleAsync(muteRole);
-                    await LogToModChannel(guild,
-                        $"🔓 **Автоматический размут**\n" +
-                        $"👤 Пользователь: {user.Mention}\n" +
-                        $"⏰ Был замучен на: {timeString}\n" +
-                        $"📅 Время: {DateTime.Now:dd.MM.yyyy HH:mm}");
-                }
-            }
-            catch { }
-        }, null, timeSpan, Timeout.InfiniteTimeSpan);
-
-        var timerKey = $"mute_{guild.Id}_{user.Id}";
-        if (activeTimers.ContainsKey(timerKey))
-        {
-            activeTimers[timerKey]?.Dispose();
-        }
-        activeTimers[timerKey] = timer;
-
-        await message.Channel.SendMessageAsync(
-            $"🔇 Пользователь {user.Mention} замучен на **{timeString}**\n" +
-            $"📝 Причина: {reason}\n" +
-            $"⏰ Размут в: {DateTime.Now.Add(timeSpan):HH:mm}");
-
-        await LogToModChannel(guild,
-            $"🔇 **Временный мут**\n" +
-            $"👤 Пользователь: {user.Mention}\n" +
-            $"👮 Модератор: {author.Mention}\n" +
-            $"⏰ Время: {timeString}\n" +
-            $"📝 Причина: {reason}");
-    }
-
-    private static async Task HandleTempBan(SocketUserMessage message, string[] args, SocketGuild guild)
-    {
-        var author = message.Author as SocketGuildUser;
-        if (author == null || !author.GuildPermissions.BanMembers)
-        {
-            await message.Channel.SendMessageAsync("❌ Нужны права **Ban Members**!");
-            return;
-        }
-
-        if (args.Length < 3)
-        {
-            await message.Channel.SendMessageAsync(
-                "❌ Использование: `/tempban @пользователь время причина`\n" +
-                "Пример: `/tempban @Нарушитель 7d Оскорбления`\n" +
-                "Время: 30s, 5m, 2h, 1d, 7d");
-            return;
-        }
-
-        var user = await GetUserFromMention(args[1], guild);
-        if (user == null)
-        {
-            await message.Channel.SendMessageAsync("❌ Пользователь не найден!");
-            return;
-        }
-
-        if (user.Id == author.Id)
-        {
-            await message.Channel.SendMessageAsync("❌ Нельзя забанить себя!");
-            return;
-        }
-
-        if (!(author.GuildPermissions.Administrator || author.Hierarchy > user.Hierarchy))
-        {
-            await message.Channel.SendMessageAsync("❌ Нельзя забанить пользователя с равной или более высокой ролью!");
-            return;
-        }
-
-        var timeString = args[2];
-        var reason = args.Length > 3 ? string.Join(" ", args.Skip(3)) : "Не указана";
-
-        if (!TryParseTime(timeString, out var timeSpan))
-        {
-            await message.Channel.SendMessageAsync("❌ Неверный формат времени! Используйте: 30s, 5m, 2h, 1d, 7d");
-            return;
-        }
-
-        await guild.AddBanAsync(user, 0, reason);
-
-        var timer = new Timer(async _ =>
-        {
-            try
-            {
-                await guild.RemoveBanAsync(user);
-                await LogToModChannel(guild,
-                    $"🔓 **Автоматический разбан**\n" +
-                    $"👤 Пользователь: `{user.Username}`\n" +
-                    $"⏰ Был забанен на: {timeString}\n" +
-                    $"📅 Время: {DateTime.Now:dd.MM.yyyy HH:mm}");
-            }
-            catch { }
-        }, null, timeSpan, Timeout.InfiniteTimeSpan);
-
-        var timerKey = $"ban_{guild.Id}_{user.Id}";
-        if (activeTimers.ContainsKey(timerKey))
-        {
-            activeTimers[timerKey]?.Dispose();
-        }
-        activeTimers[timerKey] = timer;
-
-        await message.Channel.SendMessageAsync(
-            $"🔨 Пользователь {user.Mention} забанен на **{timeString}**\n" +
-            $"📝 Причина: {reason}\n" +
-            $"⏰ Разбан в: {DateTime.Now.Add(timeSpan):dd.MM.yyyy HH:mm}");
-
-        await LogToModChannel(guild,
-            $"🔨 **Временный бан**\n" +
-            $"👤 Пользователь: {user.Mention}\n" +
-            $"👮 Модератор: {author.Mention}\n" +
-            $"⏰ Время: {timeString}\n" +
-            $"📝 Причина: {reason}");
-    }
-
-    private static async Task HandleClearMessages(SocketUserMessage message, string[] args, SocketGuild guild)
-    {
-        var author = message.Author as SocketGuildUser;
-        if (author == null || !author.GuildPermissions.ManageMessages)
-        {
-            await message.Channel.SendMessageAsync("❌ Нужны права **Manage Messages**!");
-            return;
-        }
-
-        if (args.Length < 2 || !int.TryParse(args[1], out var count) || count < 1 || count > 100)
-        {
-            await message.Channel.SendMessageAsync("❌ Использование: `/clear количество` (1-100)");
-            return;
-        }
-
-        var messages = await message.Channel.GetMessagesAsync(count + 1).FlattenAsync();
-        var filteredMessages = messages.Where(m => (DateTime.UtcNow - m.CreatedAt).TotalDays <= 14);
-
-        if (message.Channel is SocketTextChannel textChannel)
-        {
-            await textChannel.DeleteMessagesAsync(filteredMessages);
-            var reply = await message.Channel.SendMessageAsync($"🧹 Удалено {filteredMessages.Count() - 1} сообщений!");
-            await Task.Delay(3000);
-            await reply.DeleteAsync();
-
-            await LogToModChannel(guild,
-                $"🧹 **Очистка сообщений**\n" +
-                $"👮 Модератор: {author.Mention}\n" +
-                $"📊 Удалено: {filteredMessages.Count() - 1} сообщений\n" +
-                $"📅 Время: {DateTime.Now:HH:mm}");
-        }
-    }
-
-    private static async Task HandleWarn(SocketUserMessage message, string[] args, SocketGuild guild)
-    {
-        var author = message.Author as SocketGuildUser;
-        if (author == null || !author.GuildPermissions.KickMembers)
-        {
-            await message.Channel.SendMessageAsync("❌ Нужны права **Kick Members**!");
-            return;
-        }
-
-        if (args.Length < 3)
-        {
-            await message.Channel.SendMessageAsync("❌ Использование: `/warn @пользователь причина`");
-            return;
-        }
-
-        var user = await GetUserFromMention(args[1], guild);
-        if (user == null)
-        {
-            await message.Channel.SendMessageAsync("❌ Пользователь не найден!");
-            return;
-        }
-
-        if (user.Id == author.Id)
-        {
-            await message.Channel.SendMessageAsync("❌ Нельзя выдать предупреждение себе!");
-            return;
-        }
-
-        if (!(author.GuildPermissions.Administrator || author.Hierarchy > user.Hierarchy))
-        {
-            await message.Channel.SendMessageAsync("❌ Нельзя выдать предупреждение пользователю с равной или более высокой ролью!");
-            return;
-        }
-
-        var reason = string.Join(" ", args.Skip(2));
-
-        // Добавляем предупреждение
-        if (!userWarnings.ContainsKey(guild.Id))
-            userWarnings[guild.Id] = new Dictionary<ulong, List<Warning>>();
-
-        if (!userWarnings[guild.Id].ContainsKey(user.Id))
-            userWarnings[guild.Id][user.Id] = new List<Warning>();
-
-        userWarnings[guild.Id][user.Id].Add(new Warning
-        {
-            Reason = reason,
-            Date = DateTime.Now,
-            ModeratorId = author.Id
-        });
-
-        var warningCount = userWarnings[guild.Id][user.Id].Count;
-
-        // Автоматические действия при накоплении предупреждений
-        string autoAction = "";
-        if (warningCount >= 5)
-        {
-            await guild.AddBanAsync(user, 0, "5 предупреждений");
-            autoAction = "🔨 Автоматический бан (5 предупреждений)";
-        }
-        else if (warningCount >= 3)
-        {
-            var muteRole = await GetOrCreateMuteRole(guild);
-            if (muteRole != null)
-            {
-                await user.AddRoleAsync(muteRole);
-                autoAction = "🔇 Автоматический мут на 1 час (3 предупреждения)";
-
-                // Авто-размут через 1 час
-                var timer = new Timer(async _ =>
-                {
-                    try
+                    if (user.Roles.Any(r => r.Id == muteRole.Id))
                     {
-                        if (user.Roles.Any(r => r.Id == muteRole.Id))
-                        {
-                            await user.RemoveRoleAsync(muteRole);
-                        }
+                        await user.RemoveRoleAsync(muteRole);
+                        await LogToModChannel(Context.Guild,
+                            $"🔓 **Автоматический размут**\n👤 {user.Mention}\n⏰ Был замучен на: {time}");
                     }
-                    catch { }
-                }, null, TimeSpan.FromHours(1), Timeout.InfiniteTimeSpan);
+                }
+                catch { }
+            }, null, timeSpan, Timeout.InfiniteTimeSpan);
 
-                var timerKey = $"auto_mute_{guild.Id}_{user.Id}";
-                if (activeTimers.ContainsKey(timerKey))
-                    activeTimers[timerKey]?.Dispose();
-                activeTimers[timerKey] = timer;
+            if (activeTimers.ContainsKey(timerKey))
+                activeTimers[timerKey]?.Dispose();
+            activeTimers[timerKey] = timer;
+
+            var embed = new EmbedBuilder()
+                .WithTitle("🔇 Временный мут")
+                .WithColor(Color.Orange)
+                .AddField("Пользователь", user.Mention, true)
+                .AddField("Модератор", author.Mention, true)
+                .AddField("Время", time, true)
+                .AddField("Причина", reason)
+                .AddField("Размут", $"<t:{((DateTimeOffset)DateTime.UtcNow.Add(timeSpan)).ToUnixTimeSeconds()}:R>")
+                .Build();
+
+            await RespondAsync(embed: embed);
+            await LogToModChannel(Context.Guild, $"🔇 **Временный мут**\n👤 {user.Mention}\n👮 {author.Mention}\n⏰ {time}\n📝 {reason}");
+        }
+
+        [SlashCommand("tempban", "Временный бан пользователя")]
+        public async Task TempBanCommand(
+            [Summary("user", "Пользователь")] SocketGuildUser user,
+            [Summary("time", "Время (1h, 1d, 7d)")] string time,
+            [Summary("reason", "Причина")] string reason = "Не указана")
+        {
+            var author = Context.User as SocketGuildUser;
+            if (author == null || !author.GuildPermissions.BanMembers)
+            {
+                await RespondAsync("❌ Нужны права **Ban Members**!", ephemeral: true);
+                return;
+            }
+
+            if (!TryParseTime(time, out var timeSpan))
+            {
+                await RespondAsync("❌ Неверный формат времени! Используйте: 1h, 1d, 7d", ephemeral: true);
+                return;
+            }
+
+            await Context.Guild.AddBanAsync(user, 0, reason);
+
+            var timerKey = $"ban_{Context.Guild.Id}_{user.Id}";
+            var timer = new Timer(async _ =>
+            {
+                try
+                {
+                    await Context.Guild.RemoveBanAsync(user);
+                    await LogToModChannel(Context.Guild,
+                        $"🔓 **Автоматический разбан**\n👤 `{user.Username}`\n⏰ Был забанен на: {time}");
+                }
+                catch { }
+            }, null, timeSpan, Timeout.InfiniteTimeSpan);
+
+            if (activeTimers.ContainsKey(timerKey))
+                activeTimers[timerKey]?.Dispose();
+            activeTimers[timerKey] = timer;
+
+            var embed = new EmbedBuilder()
+                .WithTitle("🔨 Временный бан")
+                .WithColor(Color.Red)
+                .AddField("Пользователь", user.Mention, true)
+                .AddField("Модератор", author.Mention, true)
+                .AddField("Время", time, true)
+                .AddField("Причина", reason)
+                .AddField("Разбан", $"<t:{((DateTimeOffset)DateTime.UtcNow.Add(timeSpan)).ToUnixTimeSeconds()}:R>")
+                .Build();
+
+            await RespondAsync(embed: embed);
+            await LogToModChannel(Context.Guild, $"🔨 **Временный бан**\n👤 {user.Mention}\n👮 {author.Mention}\n⏰ {time}\n📝 {reason}");
+        }
+
+        [SlashCommand("clear", "Очистить сообщения в канале")]
+        public async Task ClearCommand(
+            [Summary("amount", "Количество сообщений (1-100)")] int amount)
+        {
+            var author = Context.User as SocketGuildUser;
+            if (author == null || !author.GuildPermissions.ManageMessages)
+            {
+                await RespondAsync("❌ Нужны права **Manage Messages**!", ephemeral: true);
+                return;
+            }
+
+            if (amount < 1 || amount > 100)
+            {
+                await RespondAsync("❌ Количество должно быть от 1 до 100!", ephemeral: true);
+                return;
+            }
+
+            var messages = await Context.Channel.GetMessagesAsync(amount + 1).FlattenAsync();
+            var filteredMessages = messages.Where(m => (DateTime.UtcNow - m.CreatedAt).TotalDays <= 14);
+
+            if (Context.Channel is SocketTextChannel textChannel)
+            {
+                await textChannel.DeleteMessagesAsync(filteredMessages);
+                await RespondAsync($"🧹 Удалено {filteredMessages.Count() - 1} сообщений!", ephemeral: true);
+                await LogToModChannel(Context.Guild,
+                    $"🧹 **Очистка сообщений**\n👮 {author.Mention}\n📊 Удалено: {filteredMessages.Count() - 1}\n📢 Канал: {Context.Channel.Name}");
             }
         }
 
-        await message.Channel.SendMessageAsync(
-            $"⚠️ Пользователю {user.Mention} выдано предупреждение\n" +
-            $"📝 Причина: {reason}\n" +
-            $"📊 Всего предупреждений: {warningCount}\n" +
-            (string.IsNullOrEmpty(autoAction) ? "" : $"⚡ {autoAction}"));
-
-        await LogToModChannel(guild,
-            $"⚠️ **Выдано предупреждение**\n" +
-            $"👤 Пользователь: {user.Mention}\n" +
-            $"👮 Модератор: {author.Mention}\n" +
-            $"📝 Причина: {reason}\n" +
-            $"📊 Всего: {warningCount}\n" +
-            (string.IsNullOrEmpty(autoAction) ? "" : $"⚡ {autoAction}"));
-    }
-
-    private static async Task HandleShowWarnings(SocketUserMessage message, string[] args, SocketGuild guild)
-    {
-        var author = message.Author as SocketGuildUser;
-        if (author == null || !author.GuildPermissions.KickMembers)
+        [SlashCommand("warn", "Выдать предупреждение пользователю")]
+        public async Task WarnCommand(
+            [Summary("user", "Пользователь")] SocketGuildUser user,
+            [Summary("reason", "Причина")] string reason)
         {
-            await message.Channel.SendMessageAsync("❌ Нужны права **Kick Members**!");
-            return;
+            var author = Context.User as SocketGuildUser;
+            if (author == null || !author.GuildPermissions.KickMembers)
+            {
+                await RespondAsync("❌ Нужны права **Kick Members**!", ephemeral: true);
+                return;
+            }
+
+            if (!userWarnings.ContainsKey(Context.Guild.Id))
+                userWarnings[Context.Guild.Id] = new Dictionary<ulong, List<Warning>>();
+
+            if (!userWarnings[Context.Guild.Id].ContainsKey(user.Id))
+                userWarnings[Context.Guild.Id][user.Id] = new List<Warning>();
+
+            userWarnings[Context.Guild.Id][user.Id].Add(new Warning
+            {
+                Reason = reason,
+                Date = DateTime.Now,
+                ModeratorId = author.Id
+            });
+
+            var warningCount = userWarnings[Context.Guild.Id][user.Id].Count;
+            string autoAction = "";
+
+            if (warningCount >= 5)
+            {
+                await Context.Guild.AddBanAsync(user, 0, "5 предупреждений");
+                autoAction = "🔨 Автоматический бан (5 предупреждений)";
+            }
+            else if (warningCount >= 3)
+            {
+                var muteRole = await GetOrCreateMuteRole(Context.Guild);
+                if (muteRole != null)
+                {
+                    await user.AddRoleAsync(muteRole);
+                    autoAction = "🔇 Автоматический мут на 1 час (3 предупреждения)";
+                    
+                    var timer = new Timer(async _ =>
+                    {
+                        try
+                        {
+                            if (user.Roles.Any(r => r.Id == muteRole.Id))
+                                await user.RemoveRoleAsync(muteRole);
+                        }
+                        catch { }
+                    }, null, TimeSpan.FromHours(1), Timeout.InfiniteTimeSpan);
+                    
+                    activeTimers[$"auto_mute_{Context.Guild.Id}_{user.Id}"] = timer;
+                }
+            }
+
+            var embed = new EmbedBuilder()
+                .WithTitle("⚠️ Предупреждение")
+                .WithColor(Color.Orange)
+                .AddField("Пользователь", user.Mention, true)
+                .AddField("Модератор", author.Mention, true)
+                .AddField("Причина", reason, true)
+                .AddField("Всего предупреждений", warningCount.ToString(), true)
+                .Build();
+
+            await RespondAsync(embed: embed);
+            await LogToModChannel(Context.Guild, 
+                $"⚠️ **Предупреждение**\n👤 {user.Mention}\n👮 {author.Mention}\n📝 {reason}\n📊 Всего: {warningCount}\n{autoAction}");
         }
 
-        if (args.Length < 2)
+        [SlashCommand("warnings", "Показать предупреждения пользователя")]
+        public async Task WarningsCommand(
+            [Summary("user", "Пользователь")] SocketGuildUser user)
         {
-            await message.Channel.SendMessageAsync("❌ Использование: `/warnings @пользователь`");
-            return;
+            var author = Context.User as SocketGuildUser;
+            if (author == null || !author.GuildPermissions.KickMembers)
+            {
+                await RespondAsync("❌ Нужны права **Kick Members**!", ephemeral: true);
+                return;
+            }
+
+            if (!userWarnings.ContainsKey(Context.Guild.Id) || 
+                !userWarnings[Context.Guild.Id].ContainsKey(user.Id) || 
+                userWarnings[Context.Guild.Id][user.Id].Count == 0)
+            {
+                await RespondAsync($"✅ У пользователя {user.Mention} нет предупреждений.", ephemeral: true);
+                return;
+            }
+
+            var warnings = userWarnings[Context.Guild.Id][user.Id];
+            var embed = new EmbedBuilder()
+                .WithTitle($"⚠️ Предупреждения {user.Username}")
+                .WithColor(Color.Orange)
+                .WithThumbnailUrl(user.GetAvatarUrl() ?? user.GetDefaultAvatarUrl());
+
+            for (int i = 0; i < warnings.Count; i++)
+            {
+                var warning = warnings[i];
+                var moderator = Context.Guild.GetUser(warning.ModeratorId);
+                embed.AddField($"#{i + 1}", 
+                    $"**Причина:** {warning.Reason}\n" +
+                    $"**Модератор:** {(moderator?.Mention ?? $"ID: {warning.ModeratorId}")}\n" +
+                    $"**Дата:** {warning.Date:dd.MM.yyyy HH:mm}", 
+                    false);
+            }
+
+            embed.WithFooter($"Всего: {warnings.Count}");
+            await RespondAsync(embed: embed.Build());
         }
 
-        var user = await GetUserFromMention(args[1], guild);
-        if (user == null)
+        [SlashCommand("removewarn", "Удалить предупреждение")]
+        public async Task RemoveWarnCommand(
+            [Summary("user", "Пользователь")] SocketGuildUser user,
+            [Summary("number", "Номер предупреждения")] int number)
         {
-            await message.Channel.SendMessageAsync("❌ Пользователь не найден!");
-            return;
+            var author = Context.User as SocketGuildUser;
+            if (author == null || !author.GuildPermissions.KickMembers)
+            {
+                await RespondAsync("❌ Нужны права **Kick Members**!", ephemeral: true);
+                return;
+            }
+
+            if (!userWarnings.ContainsKey(Context.Guild.Id) || 
+                !userWarnings[Context.Guild.Id].ContainsKey(user.Id) || 
+                number > userWarnings[Context.Guild.Id][user.Id].Count || number < 1)
+            {
+                await RespondAsync("❌ Предупреждение не найдено!", ephemeral: true);
+                return;
+            }
+
+            userWarnings[Context.Guild.Id][user.Id].RemoveAt(number - 1);
+            
+            if (userWarnings[Context.Guild.Id][user.Id].Count == 0)
+                userWarnings[Context.Guild.Id].Remove(user.Id);
+
+            await RespondAsync($"✅ Предупреждение #{number} удалено у {user.Mention}");
+            await LogToModChannel(Context.Guild, 
+                $"✅ **Удалено предупреждение**\n👤 {user.Mention}\n👮 {author.Mention}\n🔢 Номер: {number}");
         }
 
-        if (!userWarnings.ContainsKey(guild.Id) || !userWarnings[guild.Id].ContainsKey(user.Id) || userWarnings[guild.Id][user.Id].Count == 0)
+        [SlashCommand("modstats", "Статистика модерации")]
+        public async Task ModStatsCommand()
         {
-            await message.Channel.SendMessageAsync($"✅ У пользователя {user.Mention} нет предупреждений.");
-            return;
+            var author = Context.User as SocketGuildUser;
+            if (author == null || !author.GuildPermissions.KickMembers)
+            {
+                await RespondAsync("❌ Нужны права **Kick Members**!", ephemeral: true);
+                return;
+            }
+
+            if (!userWarnings.ContainsKey(Context.Guild.Id) || userWarnings[Context.Guild.Id].Count == 0)
+            {
+                await RespondAsync("📊 На этом сервере еще нет предупреждений.", ephemeral: true);
+                return;
+            }
+
+            var totalWarnings = userWarnings[Context.Guild.Id].Sum(x => x.Value.Count);
+            var topUsers = userWarnings[Context.Guild.Id]
+                .OrderByDescending(x => x.Value.Count)
+                .Take(5)
+                .Select(x => {
+                    var u = Context.Guild.GetUser(x.Key);
+                    return $"• {(u?.Mention ?? $"ID: {x.Key}")}: {x.Value.Count} варнов";
+                });
+
+            var embed = new EmbedBuilder()
+                .WithTitle("📊 Статистика модерации")
+                .WithColor(Color.Purple)
+                .AddField("Всего варнов", totalWarnings.ToString(), true)
+                .AddField("Нарушителей", userWarnings[Context.Guild.Id].Count.ToString(), true)
+                .AddField("Топ нарушителей", string.Join("\n", topUsers), false)
+                .WithFooter(Context.Guild.Name)
+                .Build();
+
+            await RespondAsync(embed: embed);
         }
 
-        var warnings = userWarnings[guild.Id][user.Id];
-        var embed = new EmbedBuilder()
-            .WithTitle($"⚠️ Предупреждения пользователя {user.Username}")
-            .WithColor(Color.Orange)
-            .WithThumbnailUrl(user.GetAvatarUrl() ?? user.GetDefaultAvatarUrl());
-
-        for (int i = 0; i < warnings.Count; i++)
+        [SlashCommand("kick", "Кикнуть пользователя")]
+        public async Task KickCommand(
+            [Summary("user", "Пользователь")] SocketGuildUser user,
+            [Summary("reason", "Причина")] string reason = "Не указана")
         {
-            var warning = warnings[i];
-            var moderator = guild.GetUser(warning.ModeratorId);
-            embed.AddField($"Предупреждение #{i + 1}",
-                $"📝 **Причина:** {warning.Reason}\n" +
-                $"👮 **Модератор:** {(moderator?.Mention ?? $"ID: {warning.ModeratorId}")}\n" +
-                $"📅 **Дата:** {warning.Date:dd.MM.yyyy HH:mm}", false);
+            var author = Context.User as SocketGuildUser;
+            if (author == null || !author.GuildPermissions.KickMembers)
+            {
+                await RespondAsync("❌ Нужны права **Kick Members**!", ephemeral: true);
+                return;
+            }
+
+            await user.KickAsync(reason);
+            
+            var embed = new EmbedBuilder()
+                .WithTitle("👢 Кик")
+                .WithColor(Color.Orange)
+                .AddField("Пользователь", user.Mention, true)
+                .AddField("Модератор", author.Mention, true)
+                .AddField("Причина", reason, true)
+                .Build();
+
+            await RespondAsync(embed: embed);
+            await LogToModChannel(Context.Guild, 
+                $"👢 **Кик**\n👤 {user.Mention}\n👮 {author.Mention}\n📝 {reason}");
         }
 
-        embed.WithFooter($"Всего предупреждений: {warnings.Count}");
-
-        await message.Channel.SendMessageAsync(embed: embed.Build());
-    }
-
-    private static async Task HandleRemoveWarning(SocketUserMessage message, string[] args, SocketGuild guild)
-    {
-        var author = message.Author as SocketGuildUser;
-        if (author == null || !author.GuildPermissions.KickMembers)
+        [SlashCommand("ban", "Забанить пользователя")]
+        public async Task BanCommand(
+            [Summary("user", "Пользователь")] SocketGuildUser user,
+            [Summary("reason", "Причина")] string reason = "Не указана")
         {
-            await message.Channel.SendMessageAsync("❌ Нужны права **Kick Members**!");
-            return;
+            var author = Context.User as SocketGuildUser;
+            if (author == null || !author.GuildPermissions.BanMembers)
+            {
+                await RespondAsync("❌ Нужны права **Ban Members**!", ephemeral: true);
+                return;
+            }
+
+            await Context.Guild.AddBanAsync(user, 0, reason);
+            
+            var embed = new EmbedBuilder()
+                .WithTitle("🔨 Бан")
+                .WithColor(Color.Red)
+                .AddField("Пользователь", user.Mention, true)
+                .AddField("Модератор", author.Mention, true)
+                .AddField("Причина", reason, true)
+                .Build();
+
+            await RespondAsync(embed: embed);
         }
 
-        if (args.Length < 3)
+        [SlashCommand("unban", "Разбанить пользователя по ID")]
+        public async Task UnbanCommand(
+            [Summary("user_id", "ID пользователя")] string userId)
         {
-            await message.Channel.SendMessageAsync("❌ Использование: `/removewarn @пользователь номер`");
-            return;
+            var author = Context.User as SocketGuildUser;
+            if (author == null || !author.GuildPermissions.BanMembers)
+            {
+                await RespondAsync("❌ Нужны права **Ban Members**!", ephemeral: true);
+                return;
+            }
+
+            if (!ulong.TryParse(userId, out var id))
+            {
+                await RespondAsync("❌ Неверный ID пользователя!", ephemeral: true);
+                return;
+            }
+
+            try
+            {
+                await Context.Guild.RemoveBanAsync(id);
+                await RespondAsync($"🔓 Пользователь с ID `{userId}` разбанен");
+                
+                var timerKey = $"ban_{Context.Guild.Id}_{id}";
+                if (activeTimers.ContainsKey(timerKey))
+                {
+                    activeTimers[timerKey]?.Dispose();
+                    activeTimers.Remove(timerKey);
+                }
+
+                await LogToModChannel(Context.Guild,
+                    $"🔓 **Разбан**\n👤 ID: `{userId}`\n👮 {author.Mention}");
+            }
+            catch
+            {
+                await RespondAsync("❌ Пользователь не найден в списке банов!", ephemeral: true);
+            }
         }
 
-        var user = await GetUserFromMention(args[1], guild);
-        if (user == null)
+        [SlashCommand("mute", "Замутить пользователя")]
+        public async Task MuteCommand(
+            [Summary("user", "Пользователь")] SocketGuildUser user,
+            [Summary("reason", "Причина")] string reason = "Не указана")
         {
-            await message.Channel.SendMessageAsync("❌ Пользователь не найден!");
-            return;
+            var author = Context.User as SocketGuildUser;
+            if (author == null || !author.GuildPermissions.MuteMembers)
+            {
+                await RespondAsync("❌ Нужны права **Mute Members**!", ephemeral: true);
+                return;
+            }
+
+            var muteRole = await GetOrCreateMuteRole(Context.Guild);
+            if (muteRole == null)
+            {
+                await RespondAsync("❌ Не удалось создать/найти роль для мута!", ephemeral: true);
+                return;
+            }
+
+            await user.AddRoleAsync(muteRole);
+            
+            var embed = new EmbedBuilder()
+                .WithTitle("🔇 Мут")
+                .WithColor(Color.LightGrey)
+                .AddField("Пользователь", user.Mention, true)
+                .AddField("Модератор", author.Mention, true)
+                .AddField("Причина", reason, true)
+                .Build();
+
+            await RespondAsync(embed: embed);
+            await LogToModChannel(Context.Guild,
+                $"🔇 **Мут**\n👤 {user.Mention}\n👮 {author.Mention}\n📝 {reason}");
         }
 
-        if (!int.TryParse(args[2], out var warnNumber) || warnNumber < 1)
+        [SlashCommand("unmute", "Размутить пользователя")]
+        public async Task UnmuteCommand(
+            [Summary("user", "Пользователь")] SocketGuildUser user)
         {
-            await message.Channel.SendMessageAsync("❌ Неверный номер предупреждения!");
-            return;
-        }
+            var author = Context.User as SocketGuildUser;
+            if (author == null || !author.GuildPermissions.MuteMembers)
+            {
+                await RespondAsync("❌ Нужны права **Mute Members**!", ephemeral: true);
+                return;
+            }
 
-        if (!userWarnings.ContainsKey(guild.Id) || !userWarnings[guild.Id].ContainsKey(user.Id) || warnNumber > userWarnings[guild.Id][user.Id].Count)
-        {
-            await message.Channel.SendMessageAsync("❌ Предупреждение не найдено!");
-            return;
-        }
+            var muteRole = await GetOrCreateMuteRole(Context.Guild);
+            if (muteRole == null)
+            {
+                await RespondAsync("❌ Роль для мута не найдена!", ephemeral: true);
+                return;
+            }
 
-        userWarnings[guild.Id][user.Id].RemoveAt(warnNumber - 1);
-
-        if (userWarnings[guild.Id][user.Id].Count == 0)
-        {
-            userWarnings[guild.Id].Remove(user.Id);
-        }
-
-        await message.Channel.SendMessageAsync($"✅ Предупреждение #{warnNumber} удалено у пользователя {user.Mention}");
-
-        await LogToModChannel(guild,
-            $"✅ **Удалено предупреждение**\n" +
-            $"👤 Пользователь: {user.Mention}\n" +
-            $"👮 Модератор: {author.Mention}\n" +
-            $"🔢 Номер: {warnNumber}");
-    }
-
-    private static async Task HandleKick(SocketUserMessage message, string[] args, SocketGuild guild)
-    {
-        var author = message.Author as SocketGuildUser;
-        if (author == null || !author.GuildPermissions.KickMembers)
-        {
-            await message.Channel.SendMessageAsync("❌ Нужны права **Kick Members**!");
-            return;
-        }
-
-        if (args.Length < 2)
-        {
-            await message.Channel.SendMessageAsync("❌ Использование: `/kick @пользователь [причина]`");
-            return;
-        }
-
-        var user = await GetUserFromMention(args[1], guild);
-        if (user == null)
-        {
-            await message.Channel.SendMessageAsync("❌ Пользователь не найден!");
-            return;
-        }
-
-        if (user.Id == author.Id)
-        {
-            await message.Channel.SendMessageAsync("❌ Нельзя кикнуть себя!");
-            return;
-        }
-
-        if (!(author.GuildPermissions.Administrator || author.Hierarchy > user.Hierarchy))
-        {
-            await message.Channel.SendMessageAsync("❌ Нельзя кикнуть пользователя с равной или более высокой ролью!");
-            return;
-        }
-
-        var reason = args.Length > 2 ? string.Join(" ", args.Skip(2)) : "Не указана";
-
-        await user.KickAsync(reason);
-
-        await message.Channel.SendMessageAsync(
-            $"👢 Пользователь {user.Mention} был кикнут\n" +
-            $"📝 Причина: {reason}");
-
-        await LogToModChannel(guild,
-            $"👢 **Пользователь кикнут**\n" +
-            $"👤 Пользователь: {user.Mention}\n" +
-            $"👮 Модератор: {author.Mention}\n" +
-            $"📝 Причина: {reason}");
-    }
-
-    private static async Task HandleBan(SocketUserMessage message, string[] args, SocketGuild guild)
-    {
-        var author = message.Author as SocketGuildUser;
-        if (author == null || !author.GuildPermissions.BanMembers)
-        {
-            await message.Channel.SendMessageAsync("❌ Нужны права **Ban Members**!");
-            return;
-        }
-
-        if (args.Length < 2)
-        {
-            await message.Channel.SendMessageAsync("❌ Использование: `/ban @пользователь [причина]`");
-            return;
-        }
-
-        var user = await GetUserFromMention(args[1], guild);
-        if (user == null)
-        {
-            await message.Channel.SendMessageAsync("❌ Пользователь не найден!");
-            return;
-        }
-
-        if (user.Id == author.Id)
-        {
-            await message.Channel.SendMessageAsync("❌ Нельзя забанить себя!");
-            return;
-        }
-
-        if (!(author.GuildPermissions.Administrator || author.Hierarchy > user.Hierarchy))
-        {
-            await message.Channel.SendMessageAsync("❌ Нельзя забанить пользователя с равной или более высокой ролью!");
-            return;
-        }
-
-        var reason = args.Length > 2 ? string.Join(" ", args.Skip(2)) : "Не указана";
-
-        await guild.AddBanAsync(user, 0, reason);
-
-        await message.Channel.SendMessageAsync(
-            $"🔨 Пользователь {user.Mention} забанен\n" +
-            $"📝 Причина: {reason}");
-    }
-
-    private static async Task HandleMute(SocketUserMessage message, string[] args, SocketGuild guild)
-    {
-        var author = message.Author as SocketGuildUser;
-        if (author == null || !author.GuildPermissions.MuteMembers)
-        {
-            await message.Channel.SendMessageAsync("❌ Нужны права **Mute Members**!");
-            return;
-        }
-
-        if (args.Length < 2)
-        {
-            await message.Channel.SendMessageAsync("❌ Использование: `/mute @пользователь [причина]`");
-            return;
-        }
-
-        var user = await GetUserFromMention(args[1], guild);
-        if (user == null)
-        {
-            await message.Channel.SendMessageAsync("❌ Пользователь не найден!");
-            return;
-        }
-
-        if (user.Id == author.Id)
-        {
-            await message.Channel.SendMessageAsync("❌ Нельзя замутить себя!");
-            return;
-        }
-
-        if (!(author.GuildPermissions.Administrator || author.Hierarchy > user.Hierarchy))
-        {
-            await message.Channel.SendMessageAsync("❌ Нельзя замутить пользователя с равной или более высокой ролью!");
-            return;
-        }
-
-        var reason = args.Length > 2 ? string.Join(" ", args.Skip(2)) : "Не указана";
-        var muteRole = await GetOrCreateMuteRole(guild);
-
-        if (muteRole == null)
-        {
-            await message.Channel.SendMessageAsync("❌ Не удалось создать/найти роль для мута!");
-            return;
-        }
-
-        await user.AddRoleAsync(muteRole);
-
-        await message.Channel.SendMessageAsync(
-            $"🔇 Пользователь {user.Mention} замучен\n" +
-            $"📝 Причина: {reason}");
-
-        await LogToModChannel(guild,
-            $"🔇 **Пользователь замучен**\n" +
-            $"👤 Пользователь: {user.Mention}\n" +
-            $"👮 Модератор: {author.Mention}\n" +
-            $"📝 Причина: {reason}");
-    }
-
-    private static async Task HandleUnmute(SocketUserMessage message, string[] args, SocketGuild guild)
-    {
-        var author = message.Author as SocketGuildUser;
-        if (author == null || !author.GuildPermissions.MuteMembers)
-        {
-            await message.Channel.SendMessageAsync("❌ Нужны права **Mute Members**!");
-            return;
-        }
-
-        if (args.Length < 2)
-        {
-            await message.Channel.SendMessageAsync("❌ Использование: `/unmute @пользователь`");
-            return;
-        }
-
-        var user = await GetUserFromMention(args[1], guild);
-        if (user == null)
-        {
-            await message.Channel.SendMessageAsync("❌ Пользователь не найден!");
-            return;
-        }
-
-        var muteRole = await GetOrCreateMuteRole(guild);
-        if (muteRole == null)
-        {
-            await message.Channel.SendMessageAsync("❌ Роль для мута не найдена!");
-            return;
-        }
-
-        if (!user.Roles.Any(r => r.Id == muteRole.Id))
-        {
-            await message.Channel.SendMessageAsync($"ℹ️ Пользователь {user.Mention} не замучен.");
-            return;
-        }
-
-        await user.RemoveRoleAsync(muteRole);
-
-        // Удаляем таймер если есть
-        var timerKey = $"mute_{guild.Id}_{user.Id}";
-        if (activeTimers.ContainsKey(timerKey))
-        {
-            activeTimers[timerKey]?.Dispose();
-            activeTimers.Remove(timerKey);
-        }
-
-        await message.Channel.SendMessageAsync($"🔓 Пользователь {user.Mention} размучен");
-
-        await LogToModChannel(guild,
-            $"🔓 **Пользователь размучен**\n" +
-            $"👤 Пользователь: {user.Mention}\n" +
-            $"👮 Модератор: {author.Mention}");
-    }
-
-    private static async Task HandleUnban(SocketUserMessage message, string[] args, SocketGuild guild)
-    {
-        var author = message.Author as SocketGuildUser;
-        if (author == null || !author.GuildPermissions.BanMembers)
-        {
-            await message.Channel.SendMessageAsync("❌ Нужны права **Ban Members**!");
-            return;
-        }
-
-        if (args.Length < 2)
-        {
-            await message.Channel.SendMessageAsync("❌ Использование: `/unban ID_пользователя`");
-            return;
-        }
-
-        if (!ulong.TryParse(args[1], out var userId))
-        {
-            await message.Channel.SendMessageAsync("❌ Неверный ID пользователя!");
-            return;
-        }
-
-        try
-        {
-            await guild.RemoveBanAsync(userId);
-            await message.Channel.SendMessageAsync($"🔓 Пользователь с ID `{userId}` разбанен");
-
-            // Удаляем таймер если есть
-            var timerKey = $"ban_{guild.Id}_{userId}";
+            await user.RemoveRoleAsync(muteRole);
+            
+            var timerKey = $"mute_{Context.Guild.Id}_{user.Id}";
             if (activeTimers.ContainsKey(timerKey))
             {
                 activeTimers[timerKey]?.Dispose();
                 activeTimers.Remove(timerKey);
             }
 
-            await LogToModChannel(guild,
-                $"🔓 **Пользователь разбанен**\n" +
-                $"👤 ID пользователя: `{userId}`\n" +
-                $"👮 Модератор: {author.Mention}");
+            await RespondAsync($"🔓 Пользователь {user.Mention} размучен");
+            await LogToModChannel(Context.Guild,
+                $"🔓 **Размут**\n👤 {user.Mention}\n👮 {author.Mention}");
         }
-        catch
+
+        [SlashCommand("modlog", "Настройка канала для логов")]
+        public async Task ModLogCommand(
+            [Summary("channel", "Канал для логов")] SocketTextChannel? channel = null)
         {
-            await message.Channel.SendMessageAsync("❌ Пользователь не найден в списке банов!");
+            var author = Context.User as SocketGuildUser;
+            if (author == null || !author.GuildPermissions.Administrator)
+            {
+                await RespondAsync("❌ Нужны права **Administrator**!", ephemeral: true);
+                return;
+            }
+
+            if (channel == null)
+            {
+                await RespondAsync(
+                    "📋 **Информация о логах**\n" +
+                    "Бот автоматически ищет каналы с названиями:\n" +
+                    "• `mod-log`\n• `logs`\n• `модерация`\n• `логи`\n\n" +
+                    "Используйте: `/modlog #канал` чтобы указать канал",
+                    ephemeral: true);
+            }
+            else
+            {
+                await RespondAsync($"✅ Канал {channel.Mention} будет использоваться для логов", ephemeral: true);
+            }
         }
-    }
-
-    private static async Task HandleSetRole(SocketUserMessage message, string[] args, SocketGuild guild)
-    {
-        var user = message.Author as SocketGuildUser;
-        if (user == null || !user.GuildPermissions.ManageRoles)
-        {
-            await message.Channel.SendMessageAsync("❌ Нужны права **Manage Roles**!");
-            return;
-        }
-
-        await message.Channel.SendMessageAsync(
-            "⚙️ **Настройка роли:**\n" +
-            "Бот автоматически ищет роли: Member, Участник, Новичок\n" +
-            "Чтобы установить другую роль, нужно обновить код бота.\n" +
-            "Бот работает на GitHub Actions - код можно изменить в репозитории!");
-    }
-
-    private static async Task HandleRoleInfo(SocketUserMessage message, SocketGuild guild)
-    {
-        var role = FindRoleForUser(guild);
-
-        if (role == null)
-        {
-            await message.Channel.SendMessageAsync("❌ Не найдена подходящая роль для выдачи.");
-        }
-        else
-        {
-            await message.Channel.SendMessageAsync(
-                $"🎯 **Текущая роль для выдачи:** {role.Mention}\n" +
-                $"📝 **Имя:** {role.Name}\n" +
-                $"🆔 **ID:** {role.Id}\n" +
-                $"🎨 **Цвет:** {role.Color}\n" +
-                $"⬆️ **Позиция:** {role.Position}\n\n" +
-                $"Новые участники будут получать эту роль автоматически!");
-        }
-    }
-
-    private static async Task HandlePing(SocketUserMessage message, SocketGuild guild)
-    {
-        if (client == null) return;
-        
-        await message.Channel.SendMessageAsync(
-            "🏓 **Pong!**\n" +
-            "🤖 Модерационный бот с автовыдачей ролей\n" +
-            "🏰 Серверов: " + client.Guilds.Count + "\n" +
-            "🆓 Хостинг: GitHub Actions\n" +
-            "⚡ Автовыдача ролей: ВКЛЮЧЕНО\n" +
-            "🛡️ Система модерации: АКТИВНА");
-    }
-
-    private static async Task HandleHelp(SocketUserMessage message, SocketGuild guild)
-    {
-        var embed = new EmbedBuilder()
-            .WithTitle("🤖 Moderation Bot - Помощь")
-            .WithDescription("Автоматическая выдача ролей + система модерации")
-            .WithColor(Color.Blue)
-            .AddField("🎯 Авто-функции",
-                "• Выдача роли при входе\n• Приветственное сообщение\n• Логирование действий", false)
-            .AddField("🛡️ Модерационные команды",
-                "`/tempmute @user время причина` - Временный мут\n" +
-                "`/tempban @user время причина` - Временный бан\n" +
-                "`/clear количество` - Удалить сообщения\n" +
-                "`/warn @user причина` - Выдать предупреждение\n" +
-                "`/warnings @user` - Показать предупреждения\n" +
-                "`/removewarn @user номер` - Удалить предупреждение\n" +
-                "`/kick @user причина` - Кикнуть пользователя\n" +
-                "`/ban @user причина` - Забанить пользователя\n" +
-                "`/mute @user причина` - Замутить\n" +
-                "`/unmute @user` - Размутить\n" +
-                "`/unban ID` - Разбанить", false)
-            .AddField("🔧 Основные команды",
-                "`/ping` - Проверка работы\n" +
-                "`/roleinfo` - Какая роль выдается\n" +
-                "`/help` - Эта справка\n" +
-                "`/modlog` - Настроить лог-канал\n" +
-                "`/modstats` - Статистика модерации", false)
-            .AddField("⚙️ Настройка",
-                "• Роль настраивается в коде бота\n" +
-                "• Лог-канал: `/modlog #канал`\n" +
-                "• Автодействия при 3+ варнах", false)
-            .WithFooter("Хостинг: GitHub Actions • Автоперезапуск каждые 6 часов")
-            .Build();
-
-        await message.Channel.SendMessageAsync(embed: embed);
-    }
-
-    private static async Task HandleModLog(SocketUserMessage message, string[] args, SocketGuild guild)
-    {
-        var author = message.Author as SocketGuildUser;
-        if (author == null || !author.GuildPermissions.Administrator)
-        {
-            await message.Channel.SendMessageAsync("❌ Нужны права **Administrator**!");
-            return;
-        }
-
-        if (args.Length < 2)
-        {
-            await message.Channel.SendMessageAsync(
-                "❌ Использование: `/modlog #канал`\n" +
-                "Чтобы отключить логирование: `/modlog off`");
-            return;
-        }
-
-        if (args[1].ToLower() == "off")
-        {
-            await message.Channel.SendMessageAsync("✅ Логирование отключено (функциональность сохранения настроек требует базы данных)");
-            return;
-        }
-
-        await message.Channel.SendMessageAsync(
-            "✅ В текущей версии бот ищет каналы с названиями:\n" +
-            "• `mod-log`\n• `logs`\n• `moderator`\n• `модерация`\n• `логи`\n\n" +
-            "Для сохранения настроек канала нужна база данных.");
-    }
-
-    private static async Task HandleModStats(SocketUserMessage message, SocketGuild guild)
-    {
-        var author = message.Author as SocketGuildUser;
-        if (author == null || !author.GuildPermissions.KickMembers)
-        {
-            await message.Channel.SendMessageAsync("❌ Нужны права **Kick Members**!");
-            return;
-        }
-
-        if (!userWarnings.ContainsKey(guild.Id) || userWarnings[guild.Id].Count == 0)
-        {
-            await message.Channel.SendMessageAsync("📊 На этом сервере еще нет предупреждений.");
-            return;
-        }
-
-        var totalWarnings = userWarnings[guild.Id].Sum(x => x.Value.Count);
-        var topUsers = userWarnings[guild.Id]
-            .OrderByDescending(x => x.Value.Count)
-            .Take(5)
-            .Select(x => {
-                var user = guild.GetUser(x.Key);
-                return $"• {(user?.Mention ?? $"ID: {x.Key}")}: {x.Value.Count} предупреждений";
-            });
-
-        var embed = new EmbedBuilder()
-            .WithTitle("📊 Статистика модерации")
-            .WithColor(Color.Purple)
-            .AddField("Всего предупреждений", totalWarnings.ToString(), true)
-            .AddField("Пользователей с предупреждениями", userWarnings[guild.Id].Count.ToString(), true)
-            .AddField("Топ нарушителей", string.Join("\n", topUsers), false)
-            .WithFooter($"Сервер: {guild.Name}")
-            .Build();
-
-        await message.Channel.SendMessageAsync(embed: embed);
     }
 
     // === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
@@ -1213,11 +764,8 @@ public class Program
         foreach (var roleName in possibleRoleNames)
         {
             var role = guild.Roles.FirstOrDefault(r =>
-                r.Name.Contains(roleName, StringComparison.OrdinalIgnoreCase) &&
-                !r.IsEveryone);
-
-            if (role != null)
-                return role;
+                r.Name.Contains(roleName, StringComparison.OrdinalIgnoreCase) && !r.IsEveryone);
+            if (role != null) return role;
         }
 
         return guild.Roles.FirstOrDefault(r => !r.IsEveryone && r != guild.EveryoneRole);
@@ -1229,46 +777,21 @@ public class Program
         {
             var channel = user.Guild.SystemChannel ??
                          user.Guild.TextChannels.FirstOrDefault(c =>
-                             c.Name.Contains("общ") ||
-                             c.Name.Contains("general") ||
-                             c.Name.Contains("welcome"));
+                             c.Name.Contains("общ") || c.Name.Contains("general") || c.Name.Contains("welcome"));
 
             if (channel != null)
             {
-                var message = $"👋 Добро пожаловать, {user.Mention}! Ты получил роль {role.Mention}.";
-                await channel.SendMessageAsync(message);
-                Console.WriteLine($"   📨 Welcome sent to #{channel.Name}");
+                await channel.SendMessageAsync($"👋 Добро пожаловать, {user.Mention}! Ты получил роль {role.Mention}.");
             }
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"   ⚠️ Couldn't send welcome: {ex.Message}");
-        }
-    }
-
-    private static async Task<SocketGuildUser?> GetUserFromMention(string mention, SocketGuild guild)
-    {
-        if (MentionUtils.TryParseUser(mention, out var userId))
-        {
-            return guild.GetUser(userId);
-        }
-
-        // Попробуем найти по имени
-        var users = await guild.GetUsersAsync().FlattenAsync();
-        var user = users.FirstOrDefault(u =>
-            u.Username.Contains(mention.Trim('@'), StringComparison.OrdinalIgnoreCase) ||
-            (u.Nickname != null && u.Nickname.Contains(mention.Trim('@'), StringComparison.OrdinalIgnoreCase)));
-
-        return user as SocketGuildUser;
+        catch { }
     }
 
     private static bool TryParseTime(string input, out TimeSpan timeSpan)
     {
         timeSpan = TimeSpan.Zero;
-
         var match = Regex.Match(input, @"^(\d+)([smhd])$", RegexOptions.IgnoreCase);
         if (!match.Success) return false;
-
         if (!int.TryParse(match.Groups[1].Value, out var value)) return false;
 
         return match.Groups[2].Value.ToLower() switch
@@ -1283,48 +806,29 @@ public class Program
 
     private static async Task<SocketRole?> GetOrCreateMuteRole(SocketGuild guild)
     {
-        // Ищем существующую роль
         var muteRole = guild.Roles.FirstOrDefault(r =>
             r.Name.Equals("Muted", StringComparison.OrdinalIgnoreCase) ||
-            r.Name.Equals("Мут", StringComparison.OrdinalIgnoreCase) ||
-            r.Name.Equals("Заглушен", StringComparison.OrdinalIgnoreCase));
+            r.Name.Equals("Мут", StringComparison.OrdinalIgnoreCase));
 
         if (muteRole != null) return muteRole;
 
-        // Создаем новую роль
         try
         {
             var botUser = guild.CurrentUser;
             if (botUser == null || !botUser.GuildPermissions.ManageRoles) return null;
 
             var newRole = await guild.CreateRoleAsync("Muted", GuildPermissions.None, Color.DarkGrey, false, false);
-            
-            // Ждем немного чтобы роль появилась
             await Task.Delay(1000);
             
-            // Получаем SocketRole версию
             muteRole = guild.Roles.FirstOrDefault(r => r.Id == newRole.Id);
             if (muteRole == null) return null;
 
-            // Отключаем права для всех каналов
             foreach (var channel in guild.TextChannels)
             {
                 try
                 {
                     await channel.AddPermissionOverwriteAsync(muteRole,
-                        new OverwritePermissions(
-                            sendMessages: PermValue.Deny,
-                            addReactions: PermValue.Deny));
-                }
-                catch { }
-            }
-
-            foreach (var channel in guild.VoiceChannels)
-            {
-                try
-                {
-                    await channel.AddPermissionOverwriteAsync(muteRole,
-                        new OverwritePermissions(connect: PermValue.Deny, speak: PermValue.Deny));
+                        new OverwritePermissions(sendMessages: PermValue.Deny, addReactions: PermValue.Deny));
                 }
                 catch { }
             }
@@ -1341,13 +845,9 @@ public class Program
     {
         try
         {
-            // Ищем лог-канал
             var logChannel = guild.TextChannels.FirstOrDefault(c =>
-                c.Name.Contains("mod-log") ||
-                c.Name.Contains("logs") ||
-                c.Name.Contains("moderator") ||
-                c.Name.Contains("модерация") ||
-                c.Name.Contains("логи"));
+                c.Name.Contains("mod-log") || c.Name.Contains("logs") ||
+                c.Name.Contains("moderator") || c.Name.Contains("модерация") || c.Name.Contains("логи"));
 
             if (logChannel != null)
             {
@@ -1360,9 +860,69 @@ public class Program
                 await logChannel.SendMessageAsync(embed: embed);
             }
         }
-        catch (Exception ex)
+        catch { }
+    }
+
+    private static async Task UserBannedAsync(SocketUser user, SocketGuild guild)
+    {
+        await LogToModChannel(guild, $"🔨 **Бан**\n👤 Пользователь: `{user.Username}`");
+    }
+
+    private static async Task UserUnbannedAsync(SocketUser user, SocketGuild guild)
+    {
+        await LogToModChannel(guild, $"🔓 **Разбан**\n👤 Пользователь: `{user.Username}`");
+    }
+
+    private static async Task UserLeftAsync(SocketGuild guild, SocketUser user)
+    {
+        await LogToModChannel(guild, $"🚪 **Покинул сервер**\n👤 Пользователь: `{user.Username}`");
+    }
+
+    private static async Task UserVoiceStateUpdatedAsync(SocketUser user, SocketVoiceState oldState, SocketVoiceState newState)
+    {
+        if (user is SocketGuildUser guildUser)
         {
-            Console.WriteLine($"⚠️ Error logging to mod channel: {ex.Message}");
+            if (oldState.VoiceChannel == null && newState.VoiceChannel != null)
+            {
+                await LogToModChannel(guildUser.Guild,
+                    $"🎤 **Залетел в войс**\n👤 {guildUser.Mention}\n📢 {newState.VoiceChannel.Name}");
+            }
+            else if (oldState.VoiceChannel != null && newState.VoiceChannel == null)
+            {
+                await LogToModChannel(guildUser.Guild,
+                    $"🔇 **Вышел из войса**\n👤 {guildUser.Mention}\n📢 {oldState.VoiceChannel.Name}");
+            }
+        }
+    }
+
+    private static async Task RoleCreatedAsync(SocketRole role)
+    {
+        await LogToModChannel(role.Guild, $"🆕 **Создана роль**\n🎭 {role.Mention}");
+    }
+
+    private static async Task RoleDeletedAsync(SocketRole role)
+    {
+        await LogToModChannel(role.Guild, $"🗑️ **Удалена роль**\n🎭 `{role.Name}`");
+    }
+
+    private static async Task UserUpdatedAsync(SocketUser oldUser, SocketUser newUser)
+    {
+        if (oldUser is SocketGuildUser oldGuild && newUser is SocketGuildUser newGuild)
+        {
+            var oldRoles = oldGuild.Roles.Select(r => r.Id).ToHashSet();
+            var newRoles = newGuild.Roles.Select(r => r.Id).ToHashSet();
+
+            if (!oldRoles.SetEquals(newRoles))
+            {
+                var added = newRoles.Except(oldRoles).Select(id => newGuild.Guild.GetRole(id)).Where(r => r != null);
+                var removed = oldRoles.Except(newRoles).Select(id => newGuild.Guild.GetRole(id)).Where(r => r != null);
+
+                foreach (var role in added)
+                    await LogToModChannel(newGuild.Guild, $"➕ **Добавлена роль**\n👤 {newGuild.Mention}\n🎭 {role.Mention}");
+
+                foreach (var role in removed)
+                    await LogToModChannel(newGuild.Guild, $"➖ **Удалена роль**\n👤 {newGuild.Mention}\n🎭 {role.Mention}");
+            }
         }
     }
 }
