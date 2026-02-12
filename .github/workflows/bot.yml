@@ -1,21 +1,16 @@
 name: Discord Bot
 
 on:
-  # Ручной запуск
   workflow_dispatch:
-  
-  # Автозапуск каждые 5 часов 50 минут
   schedule:
     - cron: '50 */6 * * *'
-  
-  # Автозапуск при изменении кода
   push:
     branches: [ main ]
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 часов максимум
+    timeout-minutes: 360
     
     steps:
     - name: 📥 Checkout repository
@@ -29,7 +24,8 @@ jobs:
     - name: 🔨 Build bot
       run: |
         echo "Building Discord bot..."
-        dotnet build ./bot/bot.csproj -c Release
+        dotnet restore ./bot/bot.csproj
+        dotnet build ./bot/bot.csproj -c Release --no-restore
         
     - name: 🤖 Run Discord Bot
       env:
@@ -37,14 +33,8 @@ jobs:
       run: |
         echo "🚀 Starting Discord Bot on GitHub Actions..."
         echo "Bot will run for 5 hours 45 minutes (GitHub limit)"
-        
-        # Вариант 1: Запускаем бота из папки проекта
         cd ./bot
-        timeout 345m dotnet run --configuration Release
-        
-        # ИЛИ Вариант 2: Запускаем бота с указанием пути к проекту (раскомментируйте если нужно)
-        # timeout 345m dotnet run --project ./bot/bot.csproj --configuration Release
-        
+        timeout 345m dotnet run --configuration Release --no-build
         echo "⏰ Time's up! Bot will restart in 15 minutes via schedule"
         
     - name: 📝 Log completion
