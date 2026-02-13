@@ -3,11 +3,8 @@ using Discord.Audio;
 using Discord.WebSocket;
 using Discord.Interactions;
 using Microsoft.Extensions.DependencyInjection;
-using YoutubeExplode;
-using YoutubeExplode.Videos.Streams;
 using System.Diagnostics;
 using System.Collections.Concurrent;
-using System.Net.Http;
 using System.Text.Json;
 
 public class Program
@@ -15,11 +12,8 @@ public class Program
     private static DiscordSocketClient? client;
     private static InteractionService? interactions;
     private static IServiceProvider? services;
-    private static YoutubeClient youtube = new();
-    private static HttpClient httpClient = new();
-    
-    // Хранилище для очередей и состояний
     private static ConcurrentDictionary<ulong, MusicPlayer> musicPlayers = new();
+    private static HttpClient httpClient = new();
 
     public static async Task Main(string[] args)
     {
@@ -36,8 +30,24 @@ public class Program
             return;
         }
 
-        Console.WriteLine("✅ Token received");
-        Console.WriteLine("🚀 Starting bot...");
+        // Проверяем наличие yt-dlp
+        try
+        {
+            var check = Process.Start(new ProcessStartInfo
+            {
+                FileName = "yt-dlp",
+                Arguments = "--version",
+                RedirectStandardOutput = true,
+                UseShellExecute = false
+            });
+            await check.WaitForExitAsync();
+            Console.WriteLine($"✅ yt-dlp version: {(await check.StandardOutput.ReadToEndAsync()).Trim()}");
+        }
+        catch
+        {
+            Console.WriteLine("❌ yt-dlp not found! Installing...");
+            Process.Start("pip", "install yt-dlp").WaitForExit();
+        }
 
         services = new ServiceCollection()
             .AddSingleton<DiscordSocketClient>()
@@ -100,7 +110,6 @@ public class Program
     {
         if (user.IsBot) return;
 
-        // Проверяем, остались ли люди в канале
         if (oldState.VoiceChannel != null && newState.VoiceChannel == null)
         {
             var guild = (oldState.VoiceChannel as SocketGuildChannel)?.Guild;
@@ -134,10 +143,10 @@ public class Program
         public IVoiceChannel? VoiceChannel { get; set; }
         public ITextChannel? TextChannel { get; set; }
         public Process? FfmpegProcess { get; set; }
+        public Process? YtDlpProcess { get; set; }
         public IAudioClient? AudioClient { get; set; }
         public SongInfo? CurrentSong { get; set; }
         public CancellationTokenSource? PlaybackCts { get; set; }
-        public Task? PlayingTask { get; set; }
 
         public void Stop()
         {
@@ -151,15 +160,15 @@ public class Program
             }
             catch { }
             
-            FfmpegProcess = null;
-            
             try
             {
-                PlaybackCts?.Cancel();
-                PlaybackCts?.Dispose();
+                YtDlpProcess?.Kill();
+                YtDlpProcess?.Dispose();
             }
             catch { }
             
+            PlaybackCts?.Cancel();
+            PlaybackCts?.Dispose();
             PlaybackCts = null;
             Queue.Clear();
         }
@@ -173,14 +182,11 @@ public class Program
         public TimeSpan Duration { get; set; }
         public string Thumbnail { get; set; } = "";
         public ulong RequestedBy { get; set; }
-        public string StreamUrl { get; set; } = "";
     }
 
     public class MusicCommands : InteractionModuleBase<SocketInteractionContext>
     {
         private readonly DiscordSocketClient _client;
-        private static YoutubeClient youtube = new();
-        private static HttpClient httpClient = new();
 
         public MusicCommands(DiscordSocketClient client)
         {
@@ -209,19 +215,8 @@ public class Program
             {
                 await FollowupAsync($"🔍 Ищу: {query}...");
 
-                // Поиск видео
-                SongInfo song;
-
-                if (Uri.IsWellFormedUriString(query, UriKind.Absolute))
-                {
-                    // Прямая ссылка
-                    song = await GetVideoInfo(query);
-                }
-                else
-                {
-                    // Поиск по названию
-                    song = await SearchVideo(query);
-                }
+                // Получаем информацию о видео через yt-dlp
+                var song = await GetVideoInfo(query);
 
                 if (song == null)
                 {
@@ -257,7 +252,7 @@ public class Program
                     
                     await ModifyOriginalResponseAsync(msg => msg.Content = $"🔍 Подключаюсь и начинаю воспроизведение...");
                     
-                    // Запускаем воспроизведение в фоне
+                    // Запускаем воспроизведение
                     _ = Task.Run(async () => await PlaySong(player, song));
                     
                     var embed = new EmbedBuilder()
@@ -279,67 +274,52 @@ public class Program
             }
         }
 
-        private async Task<SongInfo?> GetVideoInfo(string url)
+        private async Task<SongInfo?> GetVideoInfo(string query)
         {
             try
             {
-                var video = await youtube.Videos.GetAsync(url);
+                // Если это не ссылка, добавляем для поиска
+                if (!Uri.IsWellFormedUriString(query, UriKind.Absolute))
+                {
+                    query = $"ytsearch1:{query}";
+                }
+
+                // Получаем информацию через yt-dlp
+                var process = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "yt-dlp",
+                    Arguments = $"--dump-json --no-playlist \"{query}\"",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                });
+
+                if (process == null) return null;
+
+                var output = await process.StandardOutput.ReadToEndAsync();
+                await process.WaitForExitAsync();
+
+                if (string.IsNullOrEmpty(output)) return null;
+
+                var json = JsonDocument.Parse(output).RootElement;
                 
+                // Парсим длительность
+                var durationStr = json.GetProperty("duration").GetInt32();
+                var duration = TimeSpan.FromSeconds(durationStr);
+
                 return new SongInfo
                 {
-                    Title = video.Title,
-                    Url = video.Url,
-                    Author = video.Author?.ChannelTitle ?? "Unknown",
-                    Duration = video.Duration ?? TimeSpan.Zero,
-                    Thumbnail = video.Thumbnails.FirstOrDefault()?.Url ?? "",
+                    Title = json.GetProperty("title").GetString() ?? "Unknown",
+                    Url = json.GetProperty("webpage_url").GetString() ?? query,
+                    Author = json.GetProperty("uploader").GetString() ?? "Unknown",
+                    Duration = duration,
+                    Thumbnail = json.GetProperty("thumbnail").GetString() ?? "",
                 };
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error getting video: {ex.Message}");
-                return null;
-            }
-        }
-
-        private async Task<SongInfo?> SearchVideo(string query)
-        {
-            try
-            {
-                // Пробуем разные варианты поиска
-                var results = new List<YoutubeExplode.Search.VideoSearchResult>();
-                await foreach (var result in youtube.Search.GetVideosAsync(query))
-                {
-                    results.Add(result);
-                    if (results.Count >= 3) break; // Берем несколько результатов на случай проблем
-                }
-
-                foreach (var searchResult in results)
-                {
-                    try
-                    {
-                        var video = await youtube.Videos.GetAsync(searchResult.Url);
-                        
-                        return new SongInfo
-                        {
-                            Title = video.Title,
-                            Url = video.Url,
-                            Author = video.Author?.ChannelTitle ?? "Unknown",
-                            Duration = video.Duration ?? TimeSpan.Zero,
-                            Thumbnail = video.Thumbnails.FirstOrDefault()?.Url ?? "",
-                        };
-                    }
-                    catch
-                    {
-                        // Если это видео недоступно, пробуем следующее
-                        continue;
-                    }
-                }
-
-                return null;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error searching: {ex.Message}");
+                Console.WriteLine($"Error getting video info: {ex.Message}");
                 return null;
             }
         }
@@ -351,31 +331,6 @@ public class Program
                 player.IsPlaying = true;
                 player.PlaybackCts = new CancellationTokenSource();
 
-                // Получаем аудио поток
-                IStreamInfo? audioStream = null;
-                
-                try
-                {
-                    var streamManifest = await youtube.Videos.Streams.GetManifestAsync(song.Url);
-                    audioStream = streamManifest.GetAudioOnlyStreams().TryGetWithHighestBitrate();
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Error getting stream: {ex.Message}");
-                    await player.TextChannel?.SendMessageAsync($"❌ Не удалось получить аудио поток для этого видео. Попробуйте другое видео.");
-                    player.IsPlaying = false;
-                    await HandleTrackEnd(player);
-                    return;
-                }
-                
-                if (audioStream == null)
-                {
-                    await player.TextChannel?.SendMessageAsync("❌ Не удалось получить аудио поток. Возможно, видео недоступно.");
-                    player.IsPlaying = false;
-                    await HandleTrackEnd(player);
-                    return;
-                }
-
                 // Подключаемся к голосовому каналу
                 if (player.VoiceChannel != null)
                 {
@@ -386,9 +341,26 @@ public class Program
                     player.IsPlaying = false;
                     return;
                 }
-                
-                // Создаем FFmpeg процесс для конвертации
-                var ffmpeg = Process.Start(new ProcessStartInfo
+
+                // Запускаем yt-dlp для получения аудио потока
+                player.YtDlpProcess = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "yt-dlp",
+                    Arguments = $"-f bestaudio -o - \"{song.Url}\"",
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                });
+
+                if (player.YtDlpProcess == null)
+                {
+                    await player.TextChannel?.SendMessageAsync("❌ Не удалось запустить yt-dlp");
+                    player.IsPlaying = false;
+                    return;
+                }
+
+                // Запускаем FFmpeg для конвертации
+                player.FfmpegProcess = Process.Start(new ProcessStartInfo
                 {
                     FileName = "ffmpeg",
                     Arguments = $"-i pipe:0 -ac 2 -f s16le -ar 48000 pipe:1",
@@ -398,31 +370,30 @@ public class Program
                     CreateNoWindow = true
                 });
 
-                if (ffmpeg == null)
+                if (player.FfmpegProcess == null)
                 {
                     await player.TextChannel?.SendMessageAsync("❌ FFmpeg не установлен");
                     player.IsPlaying = false;
                     return;
                 }
 
-                player.FfmpegProcess = ffmpeg;
-
-                // Скачиваем и передаем в FFmpeg
+                // Передаем поток из yt-dlp в FFmpeg
                 _ = Task.Run(async () =>
                 {
                     try
                     {
-                        using var audio = await youtube.Videos.Streams.GetAsync(audioStream);
-                        await audio.CopyToAsync(ffmpeg.StandardInput.BaseStream, player.PlaybackCts.Token);
-                        ffmpeg.StandardInput.Close();
+                        await player.YtDlpProcess.StandardOutput.BaseStream.CopyToAsync(
+                            player.FfmpegProcess.StandardInput.BaseStream, 
+                            player.PlaybackCts.Token);
+                        player.FfmpegProcess.StandardInput.Close();
                     }
                     catch (OperationCanceledException)
                     {
-                        Console.WriteLine("Download cancelled");
+                        Console.WriteLine("Streaming cancelled");
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"Error downloading: {ex.Message}");
+                        Console.WriteLine($"Error streaming: {ex.Message}");
                     }
                 });
 
@@ -433,8 +404,9 @@ public class Program
                     
                     try
                     {
-                        // Передаем аудио в Discord
-                        await ffmpeg.StandardOutput.BaseStream.CopyToAsync(discordStream, player.PlaybackCts.Token);
+                        await player.FfmpegProcess.StandardOutput.BaseStream.CopyToAsync(
+                            discordStream, 
+                            player.PlaybackCts.Token);
                         await discordStream.FlushAsync();
                     }
                     catch (OperationCanceledException)
@@ -487,7 +459,6 @@ public class Program
                     
                 player.CurrentSong = null;
                 
-                // Отключаемся через минуту
                 _ = Task.Delay(60000).ContinueWith(async _ =>
                 {
                     if (player.Queue.Count == 0 && !player.IsPlaying)
@@ -503,63 +474,44 @@ public class Program
         public async Task SkipCommand()
         {
             await DeferAsync();
-
-            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
+            var player = GetPlayer();
+            if (player?.CurrentSong != null)
             {
-                await FollowupAsync("❌ Нет активного воспроизведения!");
-                return;
+                player.PlaybackCts?.Cancel();
+                await FollowupAsync($"⏭️ Пропущен: **{player.CurrentSong.Title}**");
             }
-
-            if (!player.IsPlaying || player.CurrentSong == null)
-            {
-                await FollowupAsync("❌ Сейчас ничего не играет!");
-                return;
-            }
-
-            var skipped = player.CurrentSong;
-            player.PlaybackCts?.Cancel();
-
-            await FollowupAsync($"⏭️ Пропущен: **{skipped.Title}**");
+            else await FollowupAsync("❌ Сейчас ничего не играет!");
         }
 
         [SlashCommand("stop", "Остановить воспроизведение")]
         public async Task StopCommand()
         {
             await DeferAsync();
-
-            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
+            var player = GetPlayer();
+            if (player != null)
             {
-                await FollowupAsync("❌ Нет активного воспроизведения!");
-                return;
+                player.Stop();
+                if (player.VoiceChannel != null)
+                    await player.VoiceChannel.DisconnectAsync();
+                await FollowupAsync("⏹️ Воспроизведение остановлено");
             }
-
-            player.Stop();
-            if (player.VoiceChannel != null)
-                await player.VoiceChannel.DisconnectAsync();
-
-            await FollowupAsync("⏹️ Воспроизведение остановлено");
+            else await FollowupAsync("❌ Нет активного воспроизведения!");
         }
 
         [SlashCommand("queue", "Показать очередь")]
         public async Task QueueCommand()
         {
             await DeferAsync();
-
-            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
+            var player = GetPlayer();
+            if (player == null || (player.Queue.Count == 0 && player.CurrentSong == null))
             {
                 await FollowupAsync("📭 Очередь пуста!");
                 return;
             }
 
             var queueList = player.Queue.ToList();
-
-            if (queueList.Count == 0 && player.CurrentSong == null)
-            {
-                await FollowupAsync("📭 Очередь пуста!");
-                return;
-            }
-
             var description = "";
+
             for (int i = 0; i < Math.Min(queueList.Count, 10); i++)
             {
                 var track = queueList[i];
@@ -567,9 +519,7 @@ public class Program
             }
 
             if (queueList.Count > 10)
-            {
                 description += $"\n*... и ещё {queueList.Count - 10} треков*";
-            }
 
             var embed = new EmbedBuilder()
                 .WithTitle("📜 Очередь")
@@ -589,14 +539,8 @@ public class Program
         public async Task NowPlayingCommand()
         {
             await DeferAsync();
-
-            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
-            {
-                await FollowupAsync("❌ Сейчас ничего не играет!");
-                return;
-            }
-
-            if (player.CurrentSong == null)
+            var player = GetPlayer();
+            if (player?.CurrentSong == null)
             {
                 await FollowupAsync("❌ Сейчас ничего не играет!");
                 return;
@@ -619,44 +563,32 @@ public class Program
         public async Task LoopCommand()
         {
             await DeferAsync();
-
-            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
+            var player = GetPlayer();
+            if (player != null)
             {
-                await FollowupAsync("❌ Нет активного воспроизведения!");
-                return;
+                player.Loop = !player.Loop;
+                await FollowupAsync(player.Loop ? "🔁 Повтор **включен**" : "➡️ Повтор **выключен**");
             }
-
-            player.Loop = !player.Loop;
-
-            await FollowupAsync(player.Loop ? "🔁 Повтор **включен**" : "➡️ Повтор **выключен**");
+            else await FollowupAsync("❌ Нет активного воспроизведения!");
         }
 
         [SlashCommand("shuffle", "Перемешать очередь")]
         public async Task ShuffleCommand()
         {
             await DeferAsync();
-
-            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
-            {
-                await FollowupAsync("❌ Нет активного воспроизведения!");
-                return;
-            }
-
-            var list = player.Queue.ToList();
-            
-            if (list.Count < 2)
+            var player = GetPlayer();
+            if (player?.Queue.Count < 2)
             {
                 await FollowupAsync("❌ Недостаточно треков в очереди!");
                 return;
             }
 
+            var list = player!.Queue.ToList();
             var random = new Random();
             for (int i = list.Count - 1; i > 0; i--)
             {
                 int j = random.Next(i + 1);
-                var temp = list[i];
-                list[i] = list[j];
-                list[j] = temp;
+                (list[i], list[j]) = (list[j], list[i]);
             }
 
             player.Queue = new Queue<SongInfo>(list);
@@ -664,19 +596,17 @@ public class Program
         }
 
         [SlashCommand("remove", "Удалить трек из очереди")]
-        public async Task RemoveCommand(
-            [Summary("номер", "Номер трека")] int number)
+        public async Task RemoveCommand([Summary("номер", "Номер трека")] int number)
         {
             await DeferAsync();
-
-            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
+            var player = GetPlayer();
+            if (player == null || player.Queue.Count == 0)
             {
                 await FollowupAsync("❌ Очередь пуста!");
                 return;
             }
 
             var list = player.Queue.ToList();
-
             if (number < 1 || number > list.Count)
             {
                 await FollowupAsync($"❌ Неверный номер! Всего треков: {list.Count}");
@@ -686,7 +616,6 @@ public class Program
             var removed = list[number - 1];
             list.RemoveAt(number - 1);
             player.Queue = new Queue<SongInfo>(list);
-
             await FollowupAsync($"✅ Удален: **{removed.Title}**");
         }
 
@@ -694,8 +623,8 @@ public class Program
         public async Task ClearCommand()
         {
             await DeferAsync();
-
-            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
+            var player = GetPlayer();
+            if (player == null || player.Queue.Count == 0)
             {
                 await FollowupAsync("❌ Очередь уже пуста!");
                 return;
@@ -703,7 +632,6 @@ public class Program
 
             var count = player.Queue.Count;
             player.Queue.Clear();
-
             await FollowupAsync($"🧹 Очередь очищена (удалено {count} треков)");
         }
 
@@ -711,18 +639,15 @@ public class Program
         public async Task LeaveCommand()
         {
             await DeferAsync();
-
-            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
+            var player = GetPlayer();
+            if (player != null)
             {
-                await FollowupAsync("❌ Бот не в голосовом канале!");
-                return;
+                player.Stop();
+                if (player.VoiceChannel != null)
+                    await player.VoiceChannel.DisconnectAsync();
+                await FollowupAsync("👋 Отключился");
             }
-
-            player.Stop();
-            if (player.VoiceChannel != null)
-                await player.VoiceChannel.DisconnectAsync();
-
-            await FollowupAsync("👋 Отключился");
+            else await FollowupAsync("❌ Бот не в голосовом канале!");
         }
 
         [SlashCommand("help", "Показать команды")]
@@ -744,15 +669,15 @@ public class Program
                     "`/remove` - Удалить из очереди\n" +
                     "`/clear` - Очистить очередь\n" +
                     "`/leave` - Отключить", true)
-                .AddField("ℹ️ **Информация**",
-                    "Если видео недоступно, попробуйте:\n" +
-                    "• Использовать другое видео\n" +
-                    "• Написать название по-английски\n" +
-                    "• Добавить 'audio' в запрос", false)
-                .WithFooter("Требуется FFmpeg")
+                .WithFooter("Использует yt-dlp")
                 .Build();
 
             await RespondAsync(embed: embed, ephemeral: true);
+        }
+
+        private MusicPlayer? GetPlayer()
+        {
+            return musicPlayers.TryGetValue(Context.Guild.Id, out var player) ? player : null;
         }
 
         private string Truncate(string str, int maxLength)
