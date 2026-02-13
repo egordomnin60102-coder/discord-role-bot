@@ -1,4 +1,4 @@
-name: Discord Bot
+name: Discord Music Bot
 
 on:
   workflow_dispatch:
@@ -16,23 +16,38 @@ jobs:
     - name: 📥 Checkout repository
       uses: actions/checkout@v4
       
+    - name: ⚙️ Setup Java (for Lavalink)
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+        
+    - name: 📦 Download Lavalink
+      run: |
+        wget -O Lavalink.jar https://github.com/lavalink-devs/Lavalink/releases/download/3.7.10/Lavalink.jar
+        
     - name: ⚙️ Setup .NET 8
       uses: actions/setup-dotnet@v4
       with:
         dotnet-version: '8.0.x'
         
+    - name: 🚀 Start Lavalink
+      run: |
+        java -jar Lavalink.jar &
+        echo "Lavalink started"
+        sleep 10
+        
     - name: 🔨 Build bot
       run: |
-        echo "Building Discord bot..."
+        echo "Building Discord music bot..."
         dotnet restore ./bot/bot.csproj
         dotnet build ./bot/bot.csproj -c Release --no-restore
         
-    - name: 🤖 Run Discord Bot
+    - name: 🤖 Run Discord Music Bot
       env:
         DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
       run: |
-        echo "🚀 Starting Discord Bot on GitHub Actions..."
-        echo "Bot will run for 5 hours 45 minutes (GitHub limit)"
+        echo "🚀 Starting Discord Music Bot on GitHub Actions..."
         cd ./bot
         timeout 345m dotnet run --configuration Release --no-build
         echo "⏰ Time's up! Bot will restart in 15 minutes via schedule"
