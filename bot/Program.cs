@@ -46,15 +46,6 @@ public class Program
         services = new ServiceCollection()
             .AddSingleton<DiscordSocketClient>()
             .AddSingleton(x => new InteractionService(x.GetRequiredService<DiscordSocketClient>()))
-            .AddSingleton<LavaConfig>(x => new LavaConfig
-            {
-                Hostname = "127.0.0.1",
-                Port = 2333,
-                Authorization = "youshallnotpass",
-                SelfDeaf = true,
-                EnableResume = true,
-                ResumeTimeout = TimeSpan.FromSeconds(30)
-            })
             .AddSingleton<LavaNode>()
             .AddLogging(builder => builder.AddConsole())
             .BuildServiceProvider();
@@ -146,17 +137,14 @@ public class Program
     {
         if (user.IsBot || client == null) return;
 
-        // Если пользователь отключился от голосового канала
         if (oldState.VoiceChannel != null && newState.VoiceChannel == null)
         {
             var guild = (oldState.VoiceChannel as SocketGuildChannel)?.Guild;
             if (guild == null) return;
 
-            // Проверяем, остались ли люди в канале
             var voiceChannel = oldState.VoiceChannel;
             if (voiceChannel.ConnectedUsers.Count == 1 && voiceChannel.ConnectedUsers.Any(x => x.Id == client.CurrentUser.Id))
             {
-                // Если остался только бот - отключаемся через 30 секунд
                 _ = Task.Delay(30000).ContinueWith(async _ =>
                 {
                     var currentChannel = guild.VoiceChannels.FirstOrDefault(x => x.Id == voiceChannel.Id);
@@ -167,7 +155,8 @@ public class Program
                         if (player != null)
                         {
                             await player.StopAsync();
-                            await player.TextChannel?.SendMessageAsync("⏰ Отключаюсь из-за отсутствия слушателей!");
+                            if (player.TextChannel != null)
+                                await player.TextChannel.SendMessageAsync("⏰ Отключаюсь из-за отсутствия слушателей!");
                             await lavaNode.LeaveAsync(voiceChannel);
                         }
                     }
@@ -176,7 +165,7 @@ public class Program
         }
     }
 
-    private static async Task TrackEndedAsync(TrackEndedEventArgs args)
+    private static async Task TrackEndedAsync(TrackEndedEventArg args)
     {
         if (args.Reason == TrackEndReason.LoadFailed || args.Reason == TrackEndReason.Cleanup)
             return;
@@ -185,7 +174,6 @@ public class Program
         
         if (loopEnabled.ContainsKey(guild.Id) && loopEnabled[guild.Id] && args.Reason != TrackEndReason.Replaced)
         {
-            // Повтор текущего трека
             await args.Player.PlayAsync(args.Track);
             return;
         }
@@ -205,14 +193,14 @@ public class Program
                 .WithThumbnailUrl(await nextTrack.FetchArtworkAsync())
                 .Build();
 
-            await args.Player.TextChannel?.SendMessageAsync(embed: embed);
+            if (args.Player.TextChannel != null)
+                await args.Player.TextChannel.SendMessageAsync(embed: embed);
         }
         else
         {
-            // Очередь пуста
-            await args.Player.TextChannel?.SendMessageAsync("📭 Очередь закончилась! Используйте `/play` чтобы добавить новые треки.");
+            if (args.Player.TextChannel != null)
+                await args.Player.TextChannel.SendMessageAsync("📭 Очередь закончилась! Используйте `/play` чтобы добавить новые треки.");
             
-            // Отключаемся через минуту если ничего не играет
             _ = Task.Delay(60000).ContinueWith(async _ =>
             {
                 if (musicQueues[guild.Id].Count == 0 && args.Player.PlayerState == PlayerState.Stopped)
@@ -224,24 +212,25 @@ public class Program
         }
     }
 
-    private static async Task TrackStartedAsync(TrackStartedEventArgs args)
+    private static async Task TrackStartedAsync(TrackStartedEventArg args)
     {
         Console.WriteLine($"🎵 Now playing: {args.Track.Title} in {args.Player.VoiceChannel.Guild.Name}");
     }
 
-    private static async Task TrackExceptionAsync(TrackExceptionEventArgs args)
+    private static async Task TrackExceptionAsync(TrackExceptionEventArg args)
     {
         Console.WriteLine($"❌ Track exception: {args.Exception.Message}");
-        await args.Player.TextChannel?.SendMessageAsync($"❌ Ошибка воспроизведения: {args.Exception.Message}");
+        if (args.Player.TextChannel != null)
+            await args.Player.TextChannel.SendMessageAsync($"❌ Ошибка воспроизведения: {args.Exception.Message}");
     }
 
-    private static async Task TrackStuckAsync(TrackStuckEventArgs args)
+    private static async Task TrackStuckAsync(TrackStuckEventArg args)
     {
         Console.WriteLine($"❌ Track stuck: {args.Track.Title}");
-        await args.Player.TextChannel?.SendMessageAsync($"❌ Трек завис, пропускаю...");
+        if (args.Player.TextChannel != null)
+            await args.Player.TextChannel.SendMessageAsync($"❌ Трек завис, пропускаю...");
         
-        // Пропускаем зависший трек
-        if (musicQueues[args.Player.VoiceChannel.Guild.Id].Count > 0)
+        if (musicQueues.ContainsKey(args.Player.VoiceChannel.Guild.Id) && musicQueues[args.Player.VoiceChannel.Guild.Id].Count > 0)
         {
             var nextTrack = musicQueues[args.Player.VoiceChannel.Guild.Id].Dequeue();
             await args.Player.PlayAsync(nextTrack);
@@ -251,9 +240,9 @@ public class Program
     private static string FormatDuration(TimeSpan duration)
     {
         if (duration.Hours > 0)
-            return $"{duration.Hours:00}:{duration.Minutes:00}:{duration.Seconds:00}";
+            return $"{duration.Hours}:{duration.Minutes:D2}:{duration.Seconds:D2}";
         else
-            return $"{duration.Minutes:00}:{duration.Seconds:00}";
+            return $"{duration.Minutes}:{duration.Seconds:D2}";
     }
 
     // === МУЗЫКАЛЬНЫЕ КОМАНДЫ ===
@@ -281,7 +270,6 @@ public class Program
                 return;
             }
 
-            // Подключаемся к голосовому каналу
             if (!_lavaNode.HasPlayer(Context.Guild))
             {
                 try
@@ -302,7 +290,6 @@ public class Program
                 return;
             }
 
-            // Поиск трека
             SearchResponse searchResponse;
             if (Uri.IsWellFormedUriString(query, UriKind.Absolute))
             {
@@ -325,16 +312,12 @@ public class Program
                 return;
             }
 
-            // Обработка результатов
             var tracks = searchResponse.Tracks.ToList();
             var track = tracks.First();
-
-            // Добавляем информацию о запросившем
             track.Context = user.Id;
 
             if (player.PlayerState == PlayerState.Playing || player.PlayerState == PlayerState.Paused)
             {
-                // Добавляем в очередь
                 if (!musicQueues.ContainsKey(Context.Guild.Id))
                     musicQueues[Context.Guild.Id] = new Queue<LavaTrack>();
 
@@ -354,7 +337,6 @@ public class Program
             }
             else
             {
-                // Играем сразу
                 await player.PlayAsync(track);
                 
                 var embed = new EmbedBuilder()
@@ -414,15 +396,6 @@ public class Program
                 .Build();
 
             await FollowupAsync("🔍 **Результаты поиска:**", components: component);
-            
-            // Сохраняем результаты для последующего выбора
-            var searchResults = new Dictionary<string, LavaTrack>();
-            foreach (var track in tracks)
-            {
-                searchResults[track.Url] = track;
-            }
-            
-            // Обработка выбора (нужно добавить InteractionCreated handler для select menu)
         }
 
         [SlashCommand("skip", "Пропустить текущий трек")]
@@ -827,14 +800,6 @@ public class Program
             }
             
             return bar;
-        }
-
-        private string FormatDuration(TimeSpan duration)
-        {
-            if (duration.Hours > 0)
-                return $"{duration.Hours}:{duration.Minutes:D2}:{duration.Seconds:D2}";
-            else
-                return $"{duration.Minutes}:{duration.Seconds:D2}";
         }
     }
 }
