@@ -1,6 +1,12 @@
 using Discord;
 using Discord.WebSocket;
 using Discord.Interactions;
+using Victoria;
+using Victoria.Enums;
+using Victoria.EventArgs;
+using Victoria.Responses.Search;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -8,27 +14,23 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Text.RegularExpressions;
 
-public class Warning
-{
-    public string Reason { get; set; } = string.Empty;
-    public DateTime Date { get; set; }
-    public ulong ModeratorId { get; set; }
-}
-
 public class Program
 {
     private static DiscordSocketClient? client;
     private static InteractionService? interactions;
-    private static Dictionary<ulong, Dictionary<ulong, List<Warning>>> userWarnings = new();
-    private static Dictionary<string, Timer> activeTimers = new();
+    private static LavaNode? lavaNode;
+    private static IServiceProvider? services;
+    private static Dictionary<ulong, Queue<LavaTrack>> musicQueues = new();
+    private static Dictionary<ulong, bool> loopEnabled = new();
+    private static Dictionary<ulong, int> volumeLevels = new();
 
     public static async Task Main(string[] args)
     {
-        Console.Title = "Discord Moderation Bot - GitHub Hosted";
+        Console.Title = "Discord Music Bot - GitHub Hosted";
         Console.OutputEncoding = System.Text.Encoding.UTF8;
 
-        Console.WriteLine("🤖 Discord Moderation Bot - Auto Role + Moderation");
-        Console.WriteLine("==================================================");
+        Console.WriteLine("🎵 Discord Music Bot - GitHub Actions");
+        Console.WriteLine("=======================================");
 
         var token = Environment.GetEnvironmentVariable("DISCORD_TOKEN");
         if (string.IsNullOrEmpty(token))
@@ -40,41 +42,46 @@ public class Program
         Console.WriteLine("✅ Token received");
         Console.WriteLine("🚀 Starting bot...");
 
-        client = new DiscordSocketClient(new DiscordSocketConfig
-        {
-            GatewayIntents = GatewayIntents.Guilds |
-                           GatewayIntents.GuildMembers |
-                           GatewayIntents.GuildMessages |
-                           GatewayIntents.GuildVoiceStates |
-                           GatewayIntents.MessageContent,
-            LogLevel = LogSeverity.Info
-        });
+        // Настраиваем сервисы
+        services = new ServiceCollection()
+            .AddSingleton<DiscordSocketClient>()
+            .AddSingleton(x => new InteractionService(x.GetRequiredService<DiscordSocketClient>()))
+            .AddSingleton<LavaConfig>(x => new LavaConfig
+            {
+                Hostname = "127.0.0.1",
+                Port = 2333,
+                Authorization = "youshallnotpass",
+                SelfDeaf = true,
+                EnableResume = true,
+                ResumeTimeout = TimeSpan.FromSeconds(30)
+            })
+            .AddSingleton<LavaNode>()
+            .AddLogging(builder => builder.AddConsole())
+            .BuildServiceProvider();
 
-        interactions = new InteractionService(client, new InteractionServiceConfig
-        {
-            DefaultRunMode = RunMode.Async,
-            LogLevel = LogSeverity.Info
-        });
+        client = services.GetRequiredService<DiscordSocketClient>();
+        interactions = services.GetRequiredService<InteractionService>();
+        lavaNode = services.GetRequiredService<LavaNode>();
 
+        // Настройка клиента
         client.Log += LogMessage;
         client.Ready += ReadyAsync;
         client.InteractionCreated += InteractionCreatedAsync;
-        
-        // События
-        client.UserJoined += UserJoinedAsync;
-        client.UserBanned += UserBannedAsync;
-        client.UserUnbanned += UserUnbannedAsync;
-        client.UserLeft += UserLeftAsync;
         client.UserVoiceStateUpdated += UserVoiceStateUpdatedAsync;
-        client.RoleCreated += RoleCreatedAsync;
-        client.RoleDeleted += RoleDeletedAsync;
-        client.UserUpdated += UserUpdatedAsync;
 
+        // Настройка Lavalink
+        lavaNode.OnLog += LogMessage;
+        lavaNode.OnTrackEnded += TrackEndedAsync;
+        lavaNode.OnTrackStarted += TrackStartedAsync;
+        lavaNode.OnTrackException += TrackExceptionAsync;
+        lavaNode.OnTrackStuck += TrackStuckAsync;
+
+        // Вход в Discord
         await client.LoginAsync(TokenType.Bot, token);
         await client.StartAsync();
 
         Console.WriteLine("\n✅ Bot started successfully!");
-        Console.WriteLine("🎯 Ready to assign roles to new members!");
+        Console.WriteLine("🎵 Music system: ACTIVE");
         Console.WriteLine("⏰ Will run for 5h45m, then auto-restart");
 
         await Task.Delay(-1);
@@ -88,25 +95,40 @@ public class Program
 
     private static async Task ReadyAsync()
     {
-        if (client == null || interactions == null) return;
+        if (client == null || lavaNode == null) return;
         
         Console.WriteLine($"\n🎉 BOT READY: {client.CurrentUser}");
         Console.WriteLine($"🏰 Servers: {client.Guilds.Count}");
 
+        // Подключаемся к Lavalink
+        try
+        {
+            await lavaNode.ConnectAsync();
+            Console.WriteLine("✅ Connected to Lavalink!");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"❌ Failed to connect to Lavalink: {ex.Message}");
+            Console.WriteLine("Make sure Lavalink is running!");
+        }
+
         // Регистрируем команды
-        await interactions.AddModuleAsync<CommandHandler>(null);
+        await interactions.AddModuleAsync<MusicCommands>(services);
         await interactions.RegisterCommandsGloballyAsync();
         Console.WriteLine("✅ Slash commands registered globally!");
 
         foreach (var guild in client.Guilds)
         {
             Console.WriteLine($"   • {guild.Name} (ID: {guild.Id})");
-            Console.WriteLine($"     Members: {guild.MemberCount}, Roles: {guild.Roles.Count}");
-
-            if (!userWarnings.ContainsKey(guild.Id))
-            {
-                userWarnings[guild.Id] = new Dictionary<ulong, List<Warning>>();
-            }
+            
+            if (!musicQueues.ContainsKey(guild.Id))
+                musicQueues[guild.Id] = new Queue<LavaTrack>();
+            
+            if (!loopEnabled.ContainsKey(guild.Id))
+                loopEnabled[guild.Id] = false;
+                
+            if (!volumeLevels.ContainsKey(guild.Id))
+                volumeLevels[guild.Id] = 50;
         }
 
         Console.WriteLine("===========================================");
@@ -117,757 +139,702 @@ public class Program
         if (interactions == null || client == null) return;
         
         var ctx = new SocketInteractionContext(client, interaction);
-        await interactions.ExecuteCommandAsync(ctx, null);
+        await interactions.ExecuteCommandAsync(ctx, services);
     }
 
-    // === КОМАНДЫ ===
-    public class CommandHandler : InteractionModuleBase<SocketInteractionContext>
+    private static async Task UserVoiceStateUpdatedAsync(SocketUser user, SocketVoiceState oldState, SocketVoiceState newState)
     {
-        [SlashCommand("help", "Показать список всех команд")]
+        if (user.IsBot || client == null) return;
+
+        // Если пользователь отключился от голосового канала
+        if (oldState.VoiceChannel != null && newState.VoiceChannel == null)
+        {
+            var guild = (oldState.VoiceChannel as SocketGuildChannel)?.Guild;
+            if (guild == null) return;
+
+            // Проверяем, остались ли люди в канале
+            var voiceChannel = oldState.VoiceChannel;
+            if (voiceChannel.ConnectedUsers.Count == 1 && voiceChannel.ConnectedUsers.Any(x => x.Id == client.CurrentUser.Id))
+            {
+                // Если остался только бот - отключаемся через 30 секунд
+                _ = Task.Delay(30000).ContinueWith(async _ =>
+                {
+                    var currentChannel = guild.VoiceChannels.FirstOrDefault(x => x.Id == voiceChannel.Id);
+                    if (currentChannel != null && currentChannel.ConnectedUsers.Count == 1 && 
+                        currentChannel.ConnectedUsers.Any(x => x.Id == client.CurrentUser.Id) && lavaNode != null)
+                    {
+                        var player = lavaNode.GetPlayer(guild);
+                        if (player != null)
+                        {
+                            await player.StopAsync();
+                            await player.TextChannel?.SendMessageAsync("⏰ Отключаюсь из-за отсутствия слушателей!");
+                            await lavaNode.LeaveAsync(voiceChannel);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    private static async Task TrackEndedAsync(TrackEndedEventArgs args)
+    {
+        if (args.Reason == TrackEndReason.LoadFailed || args.Reason == TrackEndReason.Cleanup)
+            return;
+
+        var guild = args.Player.VoiceChannel.Guild;
+        
+        if (loopEnabled.ContainsKey(guild.Id) && loopEnabled[guild.Id] && args.Reason != TrackEndReason.Replaced)
+        {
+            // Повтор текущего трека
+            await args.Player.PlayAsync(args.Track);
+            return;
+        }
+
+        if (musicQueues.ContainsKey(guild.Id) && musicQueues[guild.Id].Count > 0)
+        {
+            var nextTrack = musicQueues[guild.Id].Dequeue();
+            await args.Player.PlayAsync(nextTrack);
+            
+            var embed = new EmbedBuilder()
+                .WithTitle("🎵 Сейчас играет")
+                .WithDescription($"[{nextTrack.Title}]({nextTrack.Url})")
+                .WithColor(Color.Green)
+                .AddField("Автор", nextTrack.Author, true)
+                .AddField("Длительность", FormatDuration(nextTrack.Duration), true)
+                .AddField("Запросил", $"<@{nextTrack.Context}>", true)
+                .WithThumbnailUrl(await nextTrack.FetchArtworkAsync())
+                .Build();
+
+            await args.Player.TextChannel?.SendMessageAsync(embed: embed);
+        }
+        else
+        {
+            // Очередь пуста
+            await args.Player.TextChannel?.SendMessageAsync("📭 Очередь закончилась! Используйте `/play` чтобы добавить новые треки.");
+            
+            // Отключаемся через минуту если ничего не играет
+            _ = Task.Delay(60000).ContinueWith(async _ =>
+            {
+                if (musicQueues[guild.Id].Count == 0 && args.Player.PlayerState == PlayerState.Stopped)
+                {
+                    await args.Player.StopAsync();
+                    await lavaNode?.LeaveAsync(args.Player.VoiceChannel);
+                }
+            });
+        }
+    }
+
+    private static async Task TrackStartedAsync(TrackStartedEventArgs args)
+    {
+        Console.WriteLine($"🎵 Now playing: {args.Track.Title} in {args.Player.VoiceChannel.Guild.Name}");
+    }
+
+    private static async Task TrackExceptionAsync(TrackExceptionEventArgs args)
+    {
+        Console.WriteLine($"❌ Track exception: {args.Exception.Message}");
+        await args.Player.TextChannel?.SendMessageAsync($"❌ Ошибка воспроизведения: {args.Exception.Message}");
+    }
+
+    private static async Task TrackStuckAsync(TrackStuckEventArgs args)
+    {
+        Console.WriteLine($"❌ Track stuck: {args.Track.Title}");
+        await args.Player.TextChannel?.SendMessageAsync($"❌ Трек завис, пропускаю...");
+        
+        // Пропускаем зависший трек
+        if (musicQueues[args.Player.VoiceChannel.Guild.Id].Count > 0)
+        {
+            var nextTrack = musicQueues[args.Player.VoiceChannel.Guild.Id].Dequeue();
+            await args.Player.PlayAsync(nextTrack);
+        }
+    }
+
+    private static string FormatDuration(TimeSpan duration)
+    {
+        if (duration.Hours > 0)
+            return $"{duration.Hours:00}:{duration.Minutes:00}:{duration.Seconds:00}";
+        else
+            return $"{duration.Minutes:00}:{duration.Seconds:00}";
+    }
+
+    // === МУЗЫКАЛЬНЫЕ КОМАНДЫ ===
+    public class MusicCommands : InteractionModuleBase<SocketInteractionContext>
+    {
+        private readonly LavaNode _lavaNode;
+        private readonly DiscordSocketClient _client;
+
+        public MusicCommands(LavaNode lavaNode, DiscordSocketClient client)
+        {
+            _lavaNode = lavaNode;
+            _client = client;
+        }
+
+        [SlashCommand("play", "Воспроизвести музыку (по названию или ссылке)")]
+        public async Task PlayCommand(
+            [Summary("запрос", "Название песни или ссылка на YouTube/Spotify")] string query)
+        {
+            await DeferAsync();
+
+            var user = Context.User as SocketGuildUser;
+            if (user == null || user.VoiceChannel == null)
+            {
+                await FollowupAsync("❌ Вы должны находиться в голосовом канале!", ephemeral: true);
+                return;
+            }
+
+            // Подключаемся к голосовому каналу
+            if (!_lavaNode.HasPlayer(Context.Guild))
+            {
+                try
+                {
+                    await _lavaNode.JoinAsync(user.VoiceChannel, Context.Channel as ITextChannel);
+                }
+                catch (Exception ex)
+                {
+                    await FollowupAsync($"❌ Не удалось подключиться: {ex.Message}");
+                    return;
+                }
+            }
+
+            var player = _lavaNode.GetPlayer(Context.Guild);
+            if (player == null)
+            {
+                await FollowupAsync("❌ Не удалось получить плеер!");
+                return;
+            }
+
+            // Поиск трека
+            SearchResponse searchResponse;
+            if (Uri.IsWellFormedUriString(query, UriKind.Absolute))
+            {
+                searchResponse = await _lavaNode.SearchAsync(SearchType.Direct, query);
+            }
+            else
+            {
+                searchResponse = await _lavaNode.SearchYouTubeAsync(query);
+            }
+
+            if (searchResponse.Status == SearchStatus.NoMatches)
+            {
+                await FollowupAsync($"❌ Ничего не найдено по запросу: {query}");
+                return;
+            }
+
+            if (searchResponse.Status == SearchStatus.LoadFailed)
+            {
+                await FollowupAsync($"❌ Не удалось загрузить трек: {searchResponse.Exception?.Message}");
+                return;
+            }
+
+            // Обработка результатов
+            var tracks = searchResponse.Tracks.ToList();
+            var track = tracks.First();
+
+            // Добавляем информацию о запросившем
+            track.Context = user.Id;
+
+            if (player.PlayerState == PlayerState.Playing || player.PlayerState == PlayerState.Paused)
+            {
+                // Добавляем в очередь
+                if (!musicQueues.ContainsKey(Context.Guild.Id))
+                    musicQueues[Context.Guild.Id] = new Queue<LavaTrack>();
+
+                musicQueues[Context.Guild.Id].Enqueue(track);
+
+                var embed = new EmbedBuilder()
+                    .WithTitle("➕ Добавлено в очередь")
+                    .WithDescription($"[{track.Title}]({track.Url})")
+                    .WithColor(Color.Blue)
+                    .AddField("Автор", track.Author, true)
+                    .AddField("Длительность", FormatDuration(track.Duration), true)
+                    .AddField("Позиция", musicQueues[Context.Guild.Id].Count, true)
+                    .WithThumbnailUrl(await track.FetchArtworkAsync())
+                    .Build();
+
+                await FollowupAsync(embed: embed);
+            }
+            else
+            {
+                // Играем сразу
+                await player.PlayAsync(track);
+                
+                var embed = new EmbedBuilder()
+                    .WithTitle("🎵 Сейчас играет")
+                    .WithDescription($"[{track.Title}]({track.Url})")
+                    .WithColor(Color.Green)
+                    .AddField("Автор", track.Author, true)
+                    .AddField("Длительность", FormatDuration(track.Duration), true)
+                    .AddField("Запросил", user.Mention, true)
+                    .WithThumbnailUrl(await track.FetchArtworkAsync())
+                    .Build();
+
+                await FollowupAsync(embed: embed);
+            }
+        }
+
+        [SlashCommand("search", "Поиск и выбор из нескольких результатов")]
+        public async Task SearchCommand(
+            [Summary("запрос", "Название для поиска")] string query)
+        {
+            await DeferAsync();
+
+            var user = Context.User as SocketGuildUser;
+            if (user == null || user.VoiceChannel == null)
+            {
+                await FollowupAsync("❌ Вы должны находиться в голосовом канале!", ephemeral: true);
+                return;
+            }
+
+            var searchResponse = await _lavaNode.SearchYouTubeAsync(query);
+            
+            if (searchResponse.Status == SearchStatus.NoMatches)
+            {
+                await FollowupAsync($"❌ Ничего не найдено по запросу: {query}");
+                return;
+            }
+
+            var tracks = searchResponse.Tracks.Take(5).ToList();
+            var selectMenu = new SelectMenuBuilder()
+                .WithPlaceholder("Выберите трек")
+                .WithCustomId("track_select")
+                .WithMinValues(1)
+                .WithMaxValues(1);
+
+            for (int i = 0; i < tracks.Count; i++)
+            {
+                var track = tracks[i];
+                selectMenu.AddOption(
+                    $"{i + 1}. {Truncate(track.Title, 50)}",
+                    track.Url,
+                    $"{track.Author} • {FormatDuration(track.Duration)}"
+                );
+            }
+
+            var component = new ComponentBuilder()
+                .WithSelectMenu(selectMenu)
+                .Build();
+
+            await FollowupAsync("🔍 **Результаты поиска:**", components: component);
+            
+            // Сохраняем результаты для последующего выбора
+            var searchResults = new Dictionary<string, LavaTrack>();
+            foreach (var track in tracks)
+            {
+                searchResults[track.Url] = track;
+            }
+            
+            // Обработка выбора (нужно добавить InteractionCreated handler для select menu)
+        }
+
+        [SlashCommand("skip", "Пропустить текущий трек")]
+        public async Task SkipCommand()
+        {
+            await DeferAsync();
+
+            if (!_lavaNode.HasPlayer(Context.Guild))
+            {
+                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                return;
+            }
+
+            var player = _lavaNode.GetPlayer(Context.Guild);
+            var currentTrack = player.Track;
+
+            if (musicQueues.ContainsKey(Context.Guild.Id) && musicQueues[Context.Guild.Id].Count > 0)
+            {
+                var nextTrack = musicQueues[Context.Guild.Id].Dequeue();
+                await player.PlayAsync(nextTrack);
+                
+                await FollowupAsync($"⏭️ Пропущен: **{currentTrack.Title}**\n🎵 Сейчас играет: **{nextTrack.Title}**");
+            }
+            else
+            {
+                await player.StopAsync();
+                await FollowupAsync($"⏹️ Остановлено: **{currentTrack.Title}**");
+            }
+        }
+
+        [SlashCommand("stop", "Остановить воспроизведение и очистить очередь")]
+        public async Task StopCommand()
+        {
+            await DeferAsync();
+
+            if (!_lavaNode.HasPlayer(Context.Guild))
+            {
+                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                return;
+            }
+
+            var player = _lavaNode.GetPlayer(Context.Guild);
+            await player.StopAsync();
+            
+            if (musicQueues.ContainsKey(Context.Guild.Id))
+                musicQueues[Context.Guild.Id].Clear();
+
+            await FollowupAsync("⏹️ Воспроизведение остановлено, очередь очищена");
+        }
+
+        [SlashCommand("pause", "Поставить на паузу")]
+        public async Task PauseCommand()
+        {
+            await DeferAsync();
+
+            if (!_lavaNode.HasPlayer(Context.Guild))
+            {
+                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                return;
+            }
+
+            var player = _lavaNode.GetPlayer(Context.Guild);
+            
+            if (player.PlayerState == PlayerState.Paused)
+            {
+                await FollowupAsync("⏸️ Уже на паузе!");
+                return;
+            }
+
+            await player.PauseAsync();
+            await FollowupAsync("⏸️ Воспроизведение приостановлено");
+        }
+
+        [SlashCommand("resume", "Возобновить воспроизведение")]
+        public async Task ResumeCommand()
+        {
+            await DeferAsync();
+
+            if (!_lavaNode.HasPlayer(Context.Guild))
+            {
+                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                return;
+            }
+
+            var player = _lavaNode.GetPlayer(Context.Guild);
+            
+            if (player.PlayerState != PlayerState.Paused)
+            {
+                await FollowupAsync("▶️ Уже играет!");
+                return;
+            }
+
+            await player.ResumeAsync();
+            await FollowupAsync("▶️ Воспроизведение возобновлено");
+        }
+
+        [SlashCommand("queue", "Показать текущую очередь")]
+        public async Task QueueCommand()
+        {
+            await DeferAsync();
+
+            if (!_lavaNode.HasPlayer(Context.Guild))
+            {
+                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                return;
+            }
+
+            var player = _lavaNode.GetPlayer(Context.Guild);
+            
+            if (!musicQueues.ContainsKey(Context.Guild.Id) || musicQueues[Context.Guild.Id].Count == 0)
+            {
+                await FollowupAsync("📭 Очередь пуста!");
+                return;
+            }
+
+            var queueList = musicQueues[Context.Guild.Id].ToList();
+            var description = "";
+
+            for (int i = 0; i < Math.Min(queueList.Count, 10); i++)
+            {
+                var track = queueList[i];
+                description += $"`{i + 1}.` [{Truncate(track.Title, 50)}]({track.Url}) [{FormatDuration(track.Duration)}]\n";
+            }
+
+            if (queueList.Count > 10)
+            {
+                description += $"\n*... и ещё {queueList.Count - 10} треков*";
+            }
+
+            var embed = new EmbedBuilder()
+                .WithTitle("📜 Очередь воспроизведения")
+                .WithDescription(description)
+                .WithColor(Color.Blue)
+                .AddField("Сейчас играет", $"[{player.Track.Title}]({player.Track.Url}) [{FormatDuration(player.Track.Duration)}]")
+                .WithFooter($"Всего треков: {queueList.Count}")
+                .Build();
+
+            await FollowupAsync(embed: embed);
+        }
+
+        [SlashCommand("nowplaying", "Что сейчас играет")]
+        public async Task NowPlayingCommand()
+        {
+            await DeferAsync();
+
+            if (!_lavaNode.HasPlayer(Context.Guild))
+            {
+                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                return;
+            }
+
+            var player = _lavaNode.GetPlayer(Context.Guild);
+            var track = player.Track;
+            var position = player.PlaybackPosition;
+
+            var progress = CreateProgressBar(position, track.Duration);
+
+            var embed = new EmbedBuilder()
+                .WithTitle("🎵 Сейчас играет")
+                .WithDescription($"[{track.Title}]({track.Url})")
+                .WithColor(Color.Green)
+                .AddField("Автор", track.Author, true)
+                .AddField("Длительность", $"{FormatDuration(position)} / {FormatDuration(track.Duration)}", true)
+                .AddField("Запросил", $"<@{track.Context}>", true)
+                .AddField("Прогресс", progress, false)
+                .WithThumbnailUrl(await track.FetchArtworkAsync())
+                .Build();
+
+            await FollowupAsync(embed: embed);
+        }
+
+        [SlashCommand("loop", "Включить/выключить повтор трека")]
+        public async Task LoopCommand()
+        {
+            await DeferAsync();
+
+            if (!_lavaNode.HasPlayer(Context.Guild))
+            {
+                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                return;
+            }
+
+            if (!loopEnabled.ContainsKey(Context.Guild.Id))
+                loopEnabled[Context.Guild.Id] = false;
+
+            loopEnabled[Context.Guild.Id] = !loopEnabled[Context.Guild.Id];
+
+            if (loopEnabled[Context.Guild.Id])
+            {
+                await FollowupAsync("🔁 Повтор трека **включен**");
+            }
+            else
+            {
+                await FollowupAsync("➡️ Повтор трека **выключен**");
+            }
+        }
+
+        [SlashCommand("shuffle", "Перемешать очередь")]
+        public async Task ShuffleCommand()
+        {
+            await DeferAsync();
+
+            if (!musicQueues.ContainsKey(Context.Guild.Id) || musicQueues[Context.Guild.Id].Count < 2)
+            {
+                await FollowupAsync("❌ Недостаточно треков в очереди для перемешивания!");
+                return;
+            }
+
+            var list = musicQueues[Context.Guild.Id].ToList();
+            var random = new Random();
+            
+            for (int i = list.Count - 1; i > 0; i--)
+            {
+                int j = random.Next(i + 1);
+                var temp = list[i];
+                list[i] = list[j];
+                list[j] = temp;
+            }
+
+            musicQueues[Context.Guild.Id] = new Queue<LavaTrack>(list);
+            await FollowupAsync("🔀 Очередь перемешана!");
+        }
+
+        [SlashCommand("remove", "Удалить трек из очереди")]
+        public async Task RemoveCommand(
+            [Summary("номер", "Номер трека в очереди")] int number)
+        {
+            await DeferAsync();
+
+            if (!musicQueues.ContainsKey(Context.Guild.Id) || musicQueues[Context.Guild.Id].Count == 0)
+            {
+                await FollowupAsync("❌ Очередь пуста!");
+                return;
+            }
+
+            if (number < 1 || number > musicQueues[Context.Guild.Id].Count)
+            {
+                await FollowupAsync($"❌ Неверный номер! Всего треков: {musicQueues[Context.Guild.Id].Count}");
+                return;
+            }
+
+            var list = musicQueues[Context.Guild.Id].ToList();
+            var removed = list[number - 1];
+            list.RemoveAt(number - 1);
+            musicQueues[Context.Guild.Id] = new Queue<LavaTrack>(list);
+
+            await FollowupAsync($"✅ Удален трек #{number}: **{removed.Title}**");
+        }
+
+        [SlashCommand("clear", "Очистить всю очередь")]
+        public async Task ClearQueueCommand()
+        {
+            await DeferAsync();
+
+            if (!musicQueues.ContainsKey(Context.Guild.Id) || musicQueues[Context.Guild.Id].Count == 0)
+            {
+                await FollowupAsync("❌ Очередь уже пуста!");
+                return;
+            }
+
+            var count = musicQueues[Context.Guild.Id].Count;
+            musicQueues[Context.Guild.Id].Clear();
+
+            await FollowupAsync($"🧹 Очередь очищена (удалено {count} треков)");
+        }
+
+        [SlashCommand("volume", "Изменить громкость")]
+        public async Task VolumeCommand(
+            [Summary("уровень", "Громкость от 0 до 100")] int volume)
+        {
+            await DeferAsync();
+
+            if (!_lavaNode.HasPlayer(Context.Guild))
+            {
+                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                return;
+            }
+
+            if (volume < 0 || volume > 100)
+            {
+                await FollowupAsync("❌ Громкость должна быть от 0 до 100!");
+                return;
+            }
+
+            var player = _lavaNode.GetPlayer(Context.Guild);
+            await player.UpdateVolumeAsync((ushort)volume);
+            
+            volumeLevels[Context.Guild.Id] = volume;
+            
+            await FollowupAsync($"🔊 Громкость установлена на {volume}%");
+        }
+
+        [SlashCommand("seek", "Перемотать на указанное время")]
+        public async Task SeekCommand(
+            [Summary("время", "Время в формате мм:сс (например 1:30)")] string time)
+        {
+            await DeferAsync();
+
+            if (!_lavaNode.HasPlayer(Context.Guild))
+            {
+                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                return;
+            }
+
+            if (!TimeSpan.TryParse($"00:{time}", out var seekTime))
+            {
+                await FollowupAsync("❌ Неверный формат времени! Используйте мм:сс (например 1:30)");
+                return;
+            }
+
+            var player = _lavaNode.GetPlayer(Context.Guild);
+            
+            if (seekTime > player.Track.Duration)
+            {
+                await FollowupAsync($"❌ Время не может превышать длительность трека ({FormatDuration(player.Track.Duration)})!");
+                return;
+            }
+
+            await player.SeekAsync(seekTime);
+            await FollowupAsync($"⏩ Перемотано на {FormatDuration(seekTime)}");
+        }
+
+        [SlashCommand("leave", "Отключить бота от голосового канала")]
+        public async Task LeaveCommand()
+        {
+            await DeferAsync();
+
+            if (!_lavaNode.HasPlayer(Context.Guild))
+            {
+                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                return;
+            }
+
+            var player = _lavaNode.GetPlayer(Context.Guild);
+            await player.StopAsync();
+            
+            if (musicQueues.ContainsKey(Context.Guild.Id))
+                musicQueues[Context.Guild.Id].Clear();
+                
+            await _lavaNode.LeaveAsync(player.VoiceChannel);
+            
+            await FollowupAsync("👋 Отключился от голосового канала");
+        }
+
+        [SlashCommand("help", "Показать список музыкальных команд")]
         public async Task HelpCommand()
         {
             var embed = new EmbedBuilder()
-                .WithTitle("🤖 Moderation Bot - Все команды")
-                .WithDescription("**Доступные слеш-команды:**")
-                .WithColor(Color.Blue)
-                .AddField("🛡️ **Модерация**", 
-                    "`/tempmute` - Временный мут\n" +
-                    "`/tempban` - Временный бан\n" +
-                    "`/mute` - Замутить\n" +
-                    "`/unmute` - Размутить\n" +
-                    "`/kick` - Кикнуть\n" +
-                    "`/ban` - Забанить\n" +
-                    "`/unban` - Разбанить\n" +
-                    "`/clear` - Очистить сообщения", true)
-                .AddField("⚠️ **Предупреждения**", 
-                    "`/warn` - Выдать варн\n" +
-                    "`/warnings` - Список варнов\n" +
-                    "`/removewarn` - Удалить варн\n" +
-                    "`/modstats` - Статистика", true)
-                .AddField("⚙️ **Информация**", 
-                    "`/roleinfo` - Инфо о роли\n" +
-                    "`/ping` - Проверка бота\n" +
-                    "`/help` - Эта справка", true)
-                .AddField("🎯 **Авто-функции**",
-                    "• Автовыдача роли новичкам\n" +
-                    "• Логирование действий\n" +
-                    "• 3 варна = мут 1ч\n" +
-                    "• 5 варнов = бан", false)
-                .WithFooter($"Серверов: {client?.Guilds.Count ?? 0}")
+                .WithTitle("🎵 Music Bot - Все команды")
+                .WithDescription("**Управление музыкой через слеш-команды:**")
+                .WithColor(Color.Purple)
+                .AddField("▶️ **Воспроизведение**", 
+                    "`/play` - Найти и играть трек\n" +
+                    "`/search` - Поиск с выбором\n" +
+                    "`/nowplaying` - Что сейчас играет\n" +
+                    "`/queue` - Показать очередь\n" +
+                    "`/loop` - Повтор трека\n" +
+                    "`/shuffle` - Перемешать очередь\n" +
+                    "`/clear` - Очистить очередь\n" +
+                    "`/remove` - Удалить из очереди", true)
+                .AddField("⏯️ **Управление**", 
+                    "`/pause` - Пауза\n" +
+                    "`/resume` - Продолжить\n" +
+                    "`/skip` - Пропустить\n" +
+                    "`/stop` - Остановить\n" +
+                    "`/seek` - Перемотка\n" +
+                    "`/volume` - Громкость\n" +
+                    "`/leave` - Отключиться", true)
+                .AddField("📋 **Форматы**",
+                    "• Название песни\n" +
+                    "• YouTube ссылка\n" +
+                    "• Spotify ссылка\n" +
+                    "• SoundCloud ссылка", false)
+                .WithFooter($"Серверов: {_client.Guilds.Count} • Хостинг: GitHub Actions")
                 .WithCurrentTimestamp()
                 .Build();
 
             await RespondAsync(embed: embed, ephemeral: true);
         }
 
-        [SlashCommand("ping", "Проверка работы бота")]
-        public async Task PingCommand()
+        private string Truncate(string str, int maxLength)
         {
-            await RespondAsync($"🏓 **Pong!**\n⚡ Задержка: {Context.Client.Latency}ms", ephemeral: true);
+            if (str.Length <= maxLength) return str;
+            return str.Substring(0, maxLength - 3) + "...";
         }
 
-        [SlashCommand("roleinfo", "Информация о роли для новичков")]
-        public async Task RoleInfoCommand()
+        private string CreateProgressBar(TimeSpan current, TimeSpan total)
         {
-            var role = FindRoleForUser(Context.Guild);
-            if (role == null)
-            {
-                await RespondAsync("❌ Не найдена подходящая роль для выдачи.", ephemeral: true);
-                return;
-            }
-
-            var embed = new EmbedBuilder()
-                .WithTitle("🎯 Роль для новичков")
-                .WithColor(role.Color)
-                .AddField("Роль", role.Mention, true)
-                .AddField("Название", role.Name, true)
-                .AddField("ID", role.Id.ToString(), true)
-                .AddField("Цвет", role.Color.ToString(), true)
-                .AddField("Позиция", role.Position.ToString(), true)
-                .WithFooter("Новые участники получают эту роль автоматически")
-                .Build();
-
-            await RespondAsync(embed: embed);
-        }
-
-        [SlashCommand("tempmute", "Временный мут пользователя")]
-        public async Task TempMuteCommand(
-            [Summary("user", "Пользователь")] SocketGuildUser user,
-            [Summary("time", "Время (30s, 5m, 2h, 1d)")] string time,
-            [Summary("reason", "Причина")] string reason = "Не указана")
-        {
-            var author = Context.User as SocketGuildUser;
-            if (author == null || !author.GuildPermissions.MuteMembers)
-            {
-                await RespondAsync("❌ Нужны права **Mute Members**!", ephemeral: true);
-                return;
-            }
-
-            if (user.Id == author.Id)
-            {
-                await RespondAsync("❌ Нельзя замутить себя!", ephemeral: true);
-                return;
-            }
-
-            if (!TryParseTime(time, out var timeSpan))
-            {
-                await RespondAsync("❌ Неверный формат времени! Используйте: 30s, 5m, 2h, 1d", ephemeral: true);
-                return;
-            }
-
-            var muteRole = await GetOrCreateMuteRole(Context.Guild);
-            if (muteRole == null)
-            {
-                await RespondAsync("❌ Не удалось создать/найти роль для мута!", ephemeral: true);
-                return;
-            }
-
-            await user.AddRoleAsync(muteRole);
-
-            var timerKey = $"mute_{Context.Guild.Id}_{user.Id}";
-            var timer = new Timer(async _ =>
-            {
-                try
-                {
-                    var currentUser = Context.Guild.GetUser(user.Id);
-                    if (currentUser != null && currentUser.Roles.Any(r => r.Id == muteRole.Id))
-                    {
-                        await currentUser.RemoveRoleAsync(muteRole);
-                        await LogToModChannel(Context.Guild,
-                            $"🔓 **Автоматический размут**\n👤 {currentUser.Mention}\n⏰ Был замучен на: {time}");
-                    }
-                }
-                catch { }
-            }, null, timeSpan, Timeout.InfiniteTimeSpan);
-
-            if (activeTimers.ContainsKey(timerKey))
-                activeTimers[timerKey]?.Dispose();
-            activeTimers[timerKey] = timer;
-
-            var embed = new EmbedBuilder()
-                .WithTitle("🔇 Временный мут")
-                .WithColor(Color.Orange)
-                .AddField("Пользователь", user.Mention, true)
-                .AddField("Модератор", author.Mention, true)
-                .AddField("Время", time, true)
-                .AddField("Причина", reason)
-                .AddField("Размут", $"<t:{((DateTimeOffset)DateTime.UtcNow.Add(timeSpan)).ToUnixTimeSeconds()}:R>")
-                .Build();
-
-            await RespondAsync(embed: embed);
-            await LogToModChannel(Context.Guild, $"🔇 **Временный мут**\n👤 {user.Mention}\n👮 {author.Mention}\n⏰ {time}\n📝 {reason}");
-        }
-
-        [SlashCommand("tempban", "Временный бан пользователя")]
-        public async Task TempBanCommand(
-            [Summary("user", "Пользователь")] SocketGuildUser user,
-            [Summary("time", "Время (1h, 1d, 7d)")] string time,
-            [Summary("reason", "Причина")] string reason = "Не указана")
-        {
-            var author = Context.User as SocketGuildUser;
-            if (author == null || !author.GuildPermissions.BanMembers)
-            {
-                await RespondAsync("❌ Нужны права **Ban Members**!", ephemeral: true);
-                return;
-            }
-
-            if (!TryParseTime(time, out var timeSpan))
-            {
-                await RespondAsync("❌ Неверный формат времени! Используйте: 1h, 1d, 7d", ephemeral: true);
-                return;
-            }
-
-            await Context.Guild.AddBanAsync(user, 0, reason);
-
-            var timerKey = $"ban_{Context.Guild.Id}_{user.Id}";
-            var timer = new Timer(async _ =>
-            {
-                try
-                {
-                    await Context.Guild.RemoveBanAsync(user);
-                    await LogToModChannel(Context.Guild,
-                        $"🔓 **Автоматический разбан**\n👤 `{user.Username}`\n⏰ Был забанен на: {time}");
-                }
-                catch { }
-            }, null, timeSpan, Timeout.InfiniteTimeSpan);
-
-            if (activeTimers.ContainsKey(timerKey))
-                activeTimers[timerKey]?.Dispose();
-            activeTimers[timerKey] = timer;
-
-            var embed = new EmbedBuilder()
-                .WithTitle("🔨 Временный бан")
-                .WithColor(Color.Red)
-                .AddField("Пользователь", user.Mention, true)
-                .AddField("Модератор", author.Mention, true)
-                .AddField("Время", time, true)
-                .AddField("Причина", reason)
-                .AddField("Разбан", $"<t:{((DateTimeOffset)DateTime.UtcNow.Add(timeSpan)).ToUnixTimeSeconds()}:R>")
-                .Build();
-
-            await RespondAsync(embed: embed);
-            await LogToModChannel(Context.Guild, $"🔨 **Временный бан**\n👤 {user.Mention}\n👮 {author.Mention}\n⏰ {time}\n📝 {reason}");
-        }
-
-        [SlashCommand("clear", "Очистить сообщения в канале")]
-        public async Task ClearCommand(
-            [Summary("amount", "Количество сообщений (1-100)")] int amount)
-        {
-            var author = Context.User as SocketGuildUser;
-            if (author == null || !author.GuildPermissions.ManageMessages)
-            {
-                await RespondAsync("❌ Нужны права **Manage Messages**!", ephemeral: true);
-                return;
-            }
-
-            if (amount < 1 || amount > 100)
-            {
-                await RespondAsync("❌ Количество должно быть от 1 до 100!", ephemeral: true);
-                return;
-            }
-
-            var messages = await Context.Channel.GetMessagesAsync(amount + 1).FlattenAsync();
-            var filteredMessages = messages.Where(m => (DateTime.UtcNow - m.CreatedAt).TotalDays <= 14);
-
-            if (Context.Channel is SocketTextChannel textChannel)
-            {
-                await textChannel.DeleteMessagesAsync(filteredMessages);
-                await RespondAsync($"🧹 Удалено {filteredMessages.Count() - 1} сообщений!", ephemeral: true);
-                await LogToModChannel(Context.Guild,
-                    $"🧹 **Очистка сообщений**\n👮 {author.Mention}\n📊 Удалено: {filteredMessages.Count() - 1}\n📢 Канал: {Context.Channel.Name}");
-            }
-        }
-
-        [SlashCommand("warn", "Выдать предупреждение пользователю")]
-        public async Task WarnCommand(
-            [Summary("user", "Пользователь")] SocketGuildUser user,
-            [Summary("reason", "Причина")] string reason)
-        {
-            var author = Context.User as SocketGuildUser;
-            if (author == null || !author.GuildPermissions.KickMembers)
-            {
-                await RespondAsync("❌ Нужны права **Kick Members**!", ephemeral: true);
-                return;
-            }
-
-            if (!userWarnings.ContainsKey(Context.Guild.Id))
-                userWarnings[Context.Guild.Id] = new Dictionary<ulong, List<Warning>>();
-
-            if (!userWarnings[Context.Guild.Id].ContainsKey(user.Id))
-                userWarnings[Context.Guild.Id][user.Id] = new List<Warning>();
-
-            userWarnings[Context.Guild.Id][user.Id].Add(new Warning
-            {
-                Reason = reason,
-                Date = DateTime.Now,
-                ModeratorId = author.Id
-            });
-
-            var warningCount = userWarnings[Context.Guild.Id][user.Id].Count;
-            string autoAction = "";
-
-            if (warningCount >= 5)
-            {
-                await Context.Guild.AddBanAsync(user, 0, "5 предупреждений");
-                autoAction = "🔨 Автоматический бан (5 предупреждений)";
-            }
-            else if (warningCount >= 3)
-            {
-                var muteRole = await GetOrCreateMuteRole(Context.Guild);
-                if (muteRole != null)
-                {
-                    await user.AddRoleAsync(muteRole);
-                    autoAction = "🔇 Автоматический мут на 1 час (3 предупреждения)";
-                    
-                    var timer = new Timer(async _ =>
-                    {
-                        try
-                        {
-                            var currentUser = Context.Guild.GetUser(user.Id);
-                            if (currentUser != null && currentUser.Roles.Any(r => r.Id == muteRole.Id))
-                                await currentUser.RemoveRoleAsync(muteRole);
-                        }
-                        catch { }
-                    }, null, TimeSpan.FromHours(1), Timeout.InfiniteTimeSpan);
-                    
-                    activeTimers[$"auto_mute_{Context.Guild.Id}_{user.Id}"] = timer;
-                }
-            }
-
-            var embed = new EmbedBuilder()
-                .WithTitle("⚠️ Предупреждение")
-                .WithColor(Color.Orange)
-                .AddField("Пользователь", user.Mention, true)
-                .AddField("Модератор", author.Mention, true)
-                .AddField("Причина", reason)
-                .AddField("Всего предупреждений", warningCount.ToString(), true)
-                .Build();
-
-            await RespondAsync(embed: embed);
-            await LogToModChannel(Context.Guild, 
-                $"⚠️ **Предупреждение**\n👤 {user.Mention}\n👮 {author.Mention}\n📝 {reason}\n📊 Всего: {warningCount}\n{autoAction}");
-        }
-
-        [SlashCommand("warnings", "Показать предупреждения пользователя")]
-        public async Task WarningsCommand(
-            [Summary("user", "Пользователь")] SocketGuildUser user)
-        {
-            var author = Context.User as SocketGuildUser;
-            if (author == null || !author.GuildPermissions.KickMembers)
-            {
-                await RespondAsync("❌ Нужны права **Kick Members**!", ephemeral: true);
-                return;
-            }
-
-            if (!userWarnings.ContainsKey(Context.Guild.Id) || 
-                !userWarnings[Context.Guild.Id].ContainsKey(user.Id) || 
-                userWarnings[Context.Guild.Id][user.Id].Count == 0)
-            {
-                await RespondAsync($"✅ У пользователя {user.Mention} нет предупреждений.", ephemeral: true);
-                return;
-            }
-
-            var warnings = userWarnings[Context.Guild.Id][user.Id];
-            var embed = new EmbedBuilder()
-                .WithTitle($"⚠️ Предупреждения {user.Username}")
-                .WithColor(Color.Orange)
-                .WithThumbnailUrl(user.GetAvatarUrl() ?? user.GetDefaultAvatarUrl());
-
-            for (int i = 0; i < warnings.Count; i++)
-            {
-                var warning = warnings[i];
-                var moderator = Context.Guild.GetUser(warning.ModeratorId);
-                embed.AddField($"#{i + 1}", 
-                    $"**Причина:** {warning.Reason}\n" +
-                    $"**Модератор:** {(moderator?.Mention ?? $"ID: {warning.ModeratorId}")}\n" +
-                    $"**Дата:** {warning.Date:dd.MM.yyyy HH:mm}", 
-                    false);
-            }
-
-            embed.WithFooter($"Всего: {warnings.Count}");
-            await RespondAsync(embed: embed.Build());
-        }
-
-        [SlashCommand("removewarn", "Удалить предупреждение")]
-        public async Task RemoveWarnCommand(
-            [Summary("user", "Пользователь")] SocketGuildUser user,
-            [Summary("number", "Номер предупреждения")] int number)
-        {
-            var author = Context.User as SocketGuildUser;
-            if (author == null || !author.GuildPermissions.KickMembers)
-            {
-                await RespondAsync("❌ Нужны права **Kick Members**!", ephemeral: true);
-                return;
-            }
-
-            if (!userWarnings.ContainsKey(Context.Guild.Id) || 
-                !userWarnings[Context.Guild.Id].ContainsKey(user.Id) || 
-                number > userWarnings[Context.Guild.Id][user.Id].Count || number < 1)
-            {
-                await RespondAsync("❌ Предупреждение не найдено!", ephemeral: true);
-                return;
-            }
-
-            userWarnings[Context.Guild.Id][user.Id].RemoveAt(number - 1);
+            int totalBars = 20;
+            double progress = current.TotalSeconds / total.TotalSeconds;
+            int filledBars = (int)Math.Round(progress * totalBars);
             
-            if (userWarnings[Context.Guild.Id][user.Id].Count == 0)
-                userWarnings[Context.Guild.Id].Remove(user.Id);
-
-            await RespondAsync($"✅ Предупреждение #{number} удалено у {user.Mention}");
-            await LogToModChannel(Context.Guild, 
-                $"✅ **Удалено предупреждение**\n👤 {user.Mention}\n👮 {author.Mention}\n🔢 Номер: {number}");
-        }
-
-        [SlashCommand("modstats", "Статистика модерации")]
-        public async Task ModStatsCommand()
-        {
-            var author = Context.User as SocketGuildUser;
-            if (author == null || !author.GuildPermissions.KickMembers)
+            string bar = "";
+            for (int i = 0; i < totalBars; i++)
             {
-                await RespondAsync("❌ Нужны права **Kick Members**!", ephemeral: true);
-                return;
+                if (i == filledBars)
+                    bar += "🔘";
+                else if (i < filledBars)
+                    bar += "▰";
+                else
+                    bar += "▱";
             }
-
-            if (!userWarnings.ContainsKey(Context.Guild.Id) || userWarnings[Context.Guild.Id].Count == 0)
-            {
-                await RespondAsync("📊 На этом сервере еще нет предупреждений.", ephemeral: true);
-                return;
-            }
-
-            var totalWarnings = userWarnings[Context.Guild.Id].Sum(x => x.Value.Count);
-            var topUsers = userWarnings[Context.Guild.Id]
-                .OrderByDescending(x => x.Value.Count)
-                .Take(5)
-                .Select(x => {
-                    var u = Context.Guild.GetUser(x.Key);
-                    return $"• {(u?.Mention ?? $"ID: {x.Key}")}: {x.Value.Count} варнов";
-                });
-
-            var embed = new EmbedBuilder()
-                .WithTitle("📊 Статистика модерации")
-                .WithColor(Color.Purple)
-                .AddField("Всего варнов", totalWarnings.ToString(), true)
-                .AddField("Нарушителей", userWarnings[Context.Guild.Id].Count.ToString(), true)
-                .AddField("Топ нарушителей", string.Join("\n", topUsers), false)
-                .WithFooter(Context.Guild.Name)
-                .Build();
-
-            await RespondAsync(embed: embed);
-        }
-
-        [SlashCommand("kick", "Кикнуть пользователя")]
-        public async Task KickCommand(
-            [Summary("user", "Пользователь")] SocketGuildUser user,
-            [Summary("reason", "Причина")] string reason = "Не указана")
-        {
-            var author = Context.User as SocketGuildUser;
-            if (author == null || !author.GuildPermissions.KickMembers)
-            {
-                await RespondAsync("❌ Нужны права **Kick Members**!", ephemeral: true);
-                return;
-            }
-
-            await user.KickAsync(reason);
             
-            var embed = new EmbedBuilder()
-                .WithTitle("👢 Кик")
-                .WithColor(Color.Orange)
-                .AddField("Пользователь", user.Mention, true)
-                .AddField("Модератор", author.Mention, true)
-                .AddField("Причина", reason, true)
-                .Build();
-
-            await RespondAsync(embed: embed);
-            await LogToModChannel(Context.Guild, 
-                $"👢 **Кик**\n👤 {user.Mention}\n👮 {author.Mention}\n📝 {reason}");
+            return bar;
         }
 
-        [SlashCommand("ban", "Забанить пользователя")]
-        public async Task BanCommand(
-            [Summary("user", "Пользователь")] SocketGuildUser user,
-            [Summary("reason", "Причина")] string reason = "Не указана")
+        private string FormatDuration(TimeSpan duration)
         {
-            var author = Context.User as SocketGuildUser;
-            if (author == null || !author.GuildPermissions.BanMembers)
-            {
-                await RespondAsync("❌ Нужны права **Ban Members**!", ephemeral: true);
-                return;
-            }
-
-            await Context.Guild.AddBanAsync(user, 0, reason);
-            
-            var embed = new EmbedBuilder()
-                .WithTitle("🔨 Бан")
-                .WithColor(Color.Red)
-                .AddField("Пользователь", user.Mention, true)
-                .AddField("Модератор", author.Mention, true)
-                .AddField("Причина", reason, true)
-                .Build();
-
-            await RespondAsync(embed: embed);
-        }
-
-        [SlashCommand("unban", "Разбанить пользователя по ID")]
-        public async Task UnbanCommand(
-            [Summary("user_id", "ID пользователя")] string userId)
-        {
-            var author = Context.User as SocketGuildUser;
-            if (author == null || !author.GuildPermissions.BanMembers)
-            {
-                await RespondAsync("❌ Нужны права **Ban Members**!", ephemeral: true);
-                return;
-            }
-
-            if (!ulong.TryParse(userId, out var id))
-            {
-                await RespondAsync("❌ Неверный ID пользователя!", ephemeral: true);
-                return;
-            }
-
-            try
-            {
-                await Context.Guild.RemoveBanAsync(id);
-                await RespondAsync($"🔓 Пользователь с ID `{userId}` разбанен");
-                
-                var timerKey = $"ban_{Context.Guild.Id}_{id}";
-                if (activeTimers.ContainsKey(timerKey))
-                {
-                    activeTimers[timerKey]?.Dispose();
-                    activeTimers.Remove(timerKey);
-                }
-
-                await LogToModChannel(Context.Guild,
-                    $"🔓 **Разбан**\n👤 ID: `{userId}`\n👮 {author.Mention}");
-            }
-            catch
-            {
-                await RespondAsync("❌ Пользователь не найден в списке банов!", ephemeral: true);
-            }
-        }
-
-        [SlashCommand("mute", "Замутить пользователя")]
-        public async Task MuteCommand(
-            [Summary("user", "Пользователь")] SocketGuildUser user,
-            [Summary("reason", "Причина")] string reason = "Не указана")
-        {
-            var author = Context.User as SocketGuildUser;
-            if (author == null || !author.GuildPermissions.MuteMembers)
-            {
-                await RespondAsync("❌ Нужны права **Mute Members**!", ephemeral: true);
-                return;
-            }
-
-            var muteRole = await GetOrCreateMuteRole(Context.Guild);
-            if (muteRole == null)
-            {
-                await RespondAsync("❌ Не удалось создать/найти роль для мута!", ephemeral: true);
-                return;
-            }
-
-            await user.AddRoleAsync(muteRole);
-            
-            var embed = new EmbedBuilder()
-                .WithTitle("🔇 Мут")
-                .WithColor(Color.LightGrey)
-                .AddField("Пользователь", user.Mention, true)
-                .AddField("Модератор", author.Mention, true)
-                .AddField("Причина", reason, true)
-                .Build();
-
-            await RespondAsync(embed: embed);
-            await LogToModChannel(Context.Guild,
-                $"🔇 **Мут**\n👤 {user.Mention}\n👮 {author.Mention}\n📝 {reason}");
-        }
-
-        [SlashCommand("unmute", "Размутить пользователя")]
-        public async Task UnmuteCommand(
-            [Summary("user", "Пользователь")] SocketGuildUser user)
-        {
-            var author = Context.User as SocketGuildUser;
-            if (author == null || !author.GuildPermissions.MuteMembers)
-            {
-                await RespondAsync("❌ Нужны права **Mute Members**!", ephemeral: true);
-                return;
-            }
-
-            var muteRole = await GetOrCreateMuteRole(Context.Guild);
-            if (muteRole == null)
-            {
-                await RespondAsync("❌ Роль для мута не найдена!", ephemeral: true);
-                return;
-            }
-
-            await user.RemoveRoleAsync(muteRole);
-            
-            var timerKey = $"mute_{Context.Guild.Id}_{user.Id}";
-            if (activeTimers.ContainsKey(timerKey))
-            {
-                activeTimers[timerKey]?.Dispose();
-                activeTimers.Remove(timerKey);
-            }
-
-            await RespondAsync($"🔓 Пользователь {user.Mention} размучен");
-            await LogToModChannel(Context.Guild,
-                $"🔓 **Размут**\n👤 {user.Mention}\n👮 {author.Mention}");
-        }
-    }
-
-    // === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
-
-    private static SocketRole? FindRoleForUser(SocketGuild guild)
-    {
-        var possibleRoleNames = new[]
-        {
-            "Member", "Участник", "Members", "Участники",
-            "Новичок", "New", "Новый", "Новые",
-            "User", "Пользователь", "Гость", "Guest"
-        };
-
-        foreach (var roleName in possibleRoleNames)
-        {
-            var role = guild.Roles.FirstOrDefault(r =>
-                r.Name.Contains(roleName, StringComparison.OrdinalIgnoreCase) && !r.IsEveryone);
-            if (role != null) return role;
-        }
-
-        return guild.Roles.FirstOrDefault(r => !r.IsEveryone && r != guild.EveryoneRole);
-    }
-
-    private static async Task SendWelcomeMessage(SocketGuildUser user, SocketRole role)
-    {
-        try
-        {
-            var channel = user.Guild.SystemChannel ??
-                         user.Guild.TextChannels.FirstOrDefault(c =>
-                             c.Name.Contains("общ") || c.Name.Contains("general") || c.Name.Contains("welcome"));
-
-            if (channel != null)
-            {
-                await channel.SendMessageAsync($"👋 Добро пожаловать, {user.Mention}! Ты получил роль {role.Mention}.");
-            }
-        }
-        catch { }
-    }
-
-    private static bool TryParseTime(string input, out TimeSpan timeSpan)
-    {
-        timeSpan = TimeSpan.Zero;
-        var match = Regex.Match(input, @"^(\d+)([smhd])$", RegexOptions.IgnoreCase);
-        if (!match.Success) return false;
-        if (!int.TryParse(match.Groups[1].Value, out var value)) return false;
-
-        return match.Groups[2].Value.ToLower() switch
-        {
-            "s" => (timeSpan = TimeSpan.FromSeconds(value)) != TimeSpan.Zero,
-            "m" => (timeSpan = TimeSpan.FromMinutes(value)) != TimeSpan.Zero,
-            "h" => (timeSpan = TimeSpan.FromHours(value)) != TimeSpan.Zero,
-            "d" => (timeSpan = TimeSpan.FromDays(value)) != TimeSpan.Zero,
-            _ => false
-        };
-    }
-
-    private static async Task<SocketRole?> GetOrCreateMuteRole(SocketGuild guild)
-    {
-        var muteRole = guild.Roles.FirstOrDefault(r =>
-            r.Name.Equals("Muted", StringComparison.OrdinalIgnoreCase) ||
-            r.Name.Equals("Мут", StringComparison.OrdinalIgnoreCase));
-
-        if (muteRole != null) return muteRole;
-
-        try
-        {
-            var botUser = guild.CurrentUser;
-            if (botUser == null || !botUser.GuildPermissions.ManageRoles) return null;
-
-            var newRole = await guild.CreateRoleAsync("Muted", GuildPermissions.None, Color.DarkGrey, false, false);
-            await Task.Delay(1000);
-            
-            muteRole = guild.Roles.FirstOrDefault(r => r.Id == newRole.Id);
-            if (muteRole == null) return null;
-
-            foreach (var channel in guild.TextChannels)
-            {
-                try
-                {
-                    await channel.AddPermissionOverwriteAsync(muteRole,
-                        new OverwritePermissions(sendMessages: PermValue.Deny, addReactions: PermValue.Deny));
-                }
-                catch { }
-            }
-
-            return muteRole;
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    private static async Task LogToModChannel(SocketGuild guild, string message)
-    {
-        try
-        {
-            var logChannel = guild.TextChannels.FirstOrDefault(c =>
-                c.Name.Contains("mod-log") || c.Name.Contains("logs") ||
-                c.Name.Contains("moderator") || c.Name.Contains("модерация") || c.Name.Contains("логи"));
-
-            if (logChannel != null)
-            {
-                var embed = new EmbedBuilder()
-                    .WithDescription(message)
-                    .WithColor(Color.DarkOrange)
-                    .WithTimestamp(DateTimeOffset.Now)
-                    .Build();
-
-                await logChannel.SendMessageAsync(embed: embed);
-            }
-        }
-        catch { }
-    }
-
-    private static async Task UserJoinedAsync(SocketGuildUser user)
-    {
-        Console.WriteLine($"\n[🎉] NEW USER: {user.Username} joined {user.Guild.Name}");
-        
-        try
-        {
-            var role = FindRoleForUser(user.Guild);
-            if (role == null)
-            {
-                Console.WriteLine($"   ⚠️ No suitable role found");
-                return;
-            }
-
-            await user.AddRoleAsync(role);
-            Console.WriteLine($"   ✅ SUCCESS: Role {role.Name} assigned!");
-            await SendWelcomeMessage(user, role);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"   💥 ERROR: {ex.Message}");
-        }
-    }
-
-    private static async Task UserBannedAsync(SocketUser user, SocketGuild guild)
-    {
-        await LogToModChannel(guild, $"🔨 **Бан**\n👤 Пользователь: `{user.Username}`");
-    }
-
-    private static async Task UserUnbannedAsync(SocketUser user, SocketGuild guild)
-    {
-        await LogToModChannel(guild, $"🔓 **Разбан**\n👤 Пользователь: `{user.Username}`");
-    }
-
-    private static async Task UserLeftAsync(SocketGuild guild, SocketUser user)
-    {
-        await LogToModChannel(guild, $"🚪 **Покинул сервер**\n👤 Пользователь: `{user.Username}`");
-    }
-
-    private static async Task UserVoiceStateUpdatedAsync(SocketUser user, SocketVoiceState oldState, SocketVoiceState newState)
-    {
-        if (user is SocketGuildUser guildUser)
-        {
-            if (oldState.VoiceChannel == null && newState.VoiceChannel != null)
-            {
-                await LogToModChannel(guildUser.Guild,
-                    $"🎤 **Залетел в войс**\n👤 {guildUser.Mention}\n📢 {newState.VoiceChannel.Name}");
-            }
-            else if (oldState.VoiceChannel != null && newState.VoiceChannel == null)
-            {
-                await LogToModChannel(guildUser.Guild,
-                    $"🔇 **Вышел из войса**\n👤 {guildUser.Mention}\n📢 {oldState.VoiceChannel.Name}");
-            }
-        }
-    }
-
-    private static async Task RoleCreatedAsync(SocketRole role)
-    {
-        await LogToModChannel(role.Guild, $"🆕 **Создана роль**\n🎭 {role.Mention}");
-    }
-
-    private static async Task RoleDeletedAsync(SocketRole role)
-    {
-        await LogToModChannel(role.Guild, $"🗑️ **Удалена роль**\n🎭 `{role.Name}`");
-    }
-
-    private static async Task UserUpdatedAsync(SocketUser oldUser, SocketUser newUser)
-    {
-        if (oldUser is SocketGuildUser oldGuild && newUser is SocketGuildUser newGuild)
-        {
-            var oldRoles = oldGuild.Roles.Select(r => r.Id).ToHashSet();
-            var newRoles = newGuild.Roles.Select(r => r.Id).ToHashSet();
-
-            if (!oldRoles.SetEquals(newRoles))
-            {
-                var added = newRoles.Except(oldRoles).Select(id => newGuild.Guild.GetRole(id)).Where(r => r != null);
-                var removed = oldRoles.Except(newRoles).Select(id => newGuild.Guild.GetRole(id)).Where(r => r != null);
-
-                foreach (var role in added)
-                    await LogToModChannel(newGuild.Guild, $"➕ **Добавлена роль**\n👤 {newGuild.Mention}\n🎭 {role.Mention}");
-
-                foreach (var role in removed)
-                    await LogToModChannel(newGuild.Guild, $"➖ **Удалена роль**\n👤 {newGuild.Mention}\n🎭 {role.Mention}");
-            }
+            if (duration.Hours > 0)
+                return $"{duration.Hours}:{duration.Minutes:D2}:{duration.Seconds:D2}";
+            else
+                return $"{duration.Minutes}:{duration.Seconds:D2}";
         }
     }
 }
