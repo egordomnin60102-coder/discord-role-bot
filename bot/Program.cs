@@ -104,18 +104,18 @@ public class Program
             if (guild == null) return;
 
             var voiceChannel = oldState.VoiceChannel;
-            if (voiceChannel.ConnectedUsers.Count == 1 && voiceChannel.ConnectedUsers.Any(x => x.Id == client?.CurrentUser.Id))
+            if (voiceChannel.ConnectedUsers.Count == 1 && voiceChannel.ConnectedUsers.Any(x => x.Id == client?.CurrentUser?.Id))
             {
                 _ = Task.Delay(30000).ContinueWith(async _ =>
                 {
                     var currentChannel = guild.VoiceChannels.FirstOrDefault(x => x.Id == voiceChannel.Id);
                     if (currentChannel != null && currentChannel.ConnectedUsers.Count == 1 && 
-                        currentChannel.ConnectedUsers.Any(x => x.Id == client?.CurrentUser.Id))
+                        currentChannel.ConnectedUsers.Any(x => x.Id == client?.CurrentUser?.Id))
                     {
                         await currentChannel.DisconnectAsync();
-                        if (musicPlayers.ContainsKey(guild.Id))
+                        if (musicPlayers.TryGetValue(guild.Id, out var player))
                         {
-                            musicPlayers[guild.Id].Stop();
+                            player.Stop();
                         }
                     }
                 });
@@ -217,7 +217,14 @@ public class Program
                 }
                 else
                 {
-                    var results = await youtube.Search.GetVideosAsync(query);
+                    // Исправление: правильно получаем результаты поиска
+                    var results = new List<YoutubeExplode.Search.VideoSearchResult>();
+                    await foreach (var result in youtube.Search.GetVideosAsync(query))
+                    {
+                        results.Add(result);
+                        if (results.Count >= 1) break; // Берем только первый результат
+                    }
+
                     var firstVideo = results.FirstOrDefault();
                     if (firstVideo == null)
                     {
@@ -308,7 +315,15 @@ public class Program
                 }
 
                 // Подключаемся к голосовому каналу
-                player.AudioClient = await player.VoiceChannel.ConnectAsync();
+                if (player.VoiceChannel != null)
+                {
+                    player.AudioClient = await player.VoiceChannel.ConnectAsync();
+                }
+                else
+                {
+                    player.IsPlaying = false;
+                    return;
+                }
                 
                 // Создаем FFmpeg процесс для конвертации
                 var ffmpeg = Process.Start(new ProcessStartInfo
@@ -346,11 +361,15 @@ public class Program
                 });
 
                 // Создаем поток для Discord
-                var discordStream = player.AudioClient.CreatePCMStream(AudioApplication.Mixed, null, 128 * 1024);
+                if (player.AudioClient != null)
+                {
+                    var discordStream = player.AudioClient.CreatePCMStream(AudioApplication.Mixed, null, 128 * 1024);
+                    
+                    // Передаем аудио в Discord
+                    await ffmpeg.StandardOutput.BaseStream.CopyToAsync(discordStream, player.PlaybackCts.Token);
+                    await discordStream.FlushAsync();
+                }
                 
-                // Передаем аудио в Discord
-                await ffmpeg.StandardOutput.BaseStream.CopyToAsync(discordStream, player.PlaybackCts.Token);
-                await discordStream.FlushAsync();
                 player.IsPlaying = false;
 
                 // После окончания трека
@@ -385,11 +404,14 @@ public class Program
                     .WithThumbnailUrl(player.CurrentSong.Thumbnail)
                     .Build();
 
-                await player.TextChannel?.SendMessageAsync(embed: embed);
+                if (player.TextChannel != null)
+                    await player.TextChannel.SendMessageAsync(embed: embed);
             }
             else
             {
-                await player.TextChannel?.SendMessageAsync("📭 Очередь закончилась!");
+                if (player.TextChannel != null)
+                    await player.TextChannel.SendMessageAsync("📭 Очередь закончилась!");
+                    
                 player.CurrentSong = null;
                 
                 // Отключаемся через минуту
@@ -397,7 +419,8 @@ public class Program
                 {
                     if (player.Queue.Count == 0 && !player.IsPlaying)
                     {
-                        await player.VoiceChannel?.DisconnectAsync();
+                        if (player.VoiceChannel != null)
+                            await player.VoiceChannel.DisconnectAsync();
                     }
                 });
             }
@@ -408,13 +431,12 @@ public class Program
         {
             await DeferAsync();
 
-            if (!musicPlayers.ContainsKey(Context.Guild.Id))
+            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
             {
                 await FollowupAsync("❌ Нет активного воспроизведения!");
                 return;
             }
 
-            var player = musicPlayers[Context.Guild.Id];
             if (!player.IsPlaying || player.CurrentSong == null)
             {
                 await FollowupAsync("❌ Сейчас ничего не играет!");
@@ -432,15 +454,15 @@ public class Program
         {
             await DeferAsync();
 
-            if (!musicPlayers.ContainsKey(Context.Guild.Id))
+            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
             {
                 await FollowupAsync("❌ Нет активного воспроизведения!");
                 return;
             }
 
-            var player = musicPlayers[Context.Guild.Id];
             player.Stop();
-            await player.VoiceChannel?.DisconnectAsync();
+            if (player.VoiceChannel != null)
+                await player.VoiceChannel.DisconnectAsync();
 
             await FollowupAsync("⏹️ Воспроизведение остановлено");
         }
@@ -450,13 +472,12 @@ public class Program
         {
             await DeferAsync();
 
-            if (!musicPlayers.ContainsKey(Context.Guild.Id))
+            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
             {
                 await FollowupAsync("📭 Очередь пуста!");
                 return;
             }
 
-            var player = musicPlayers[Context.Guild.Id];
             var queueList = player.Queue.ToList();
 
             if (queueList.Count == 0 && player.CurrentSong == null)
@@ -496,13 +517,12 @@ public class Program
         {
             await DeferAsync();
 
-            if (!musicPlayers.ContainsKey(Context.Guild.Id))
+            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
             {
                 await FollowupAsync("❌ Сейчас ничего не играет!");
                 return;
             }
 
-            var player = musicPlayers[Context.Guild.Id];
             if (player.CurrentSong == null)
             {
                 await FollowupAsync("❌ Сейчас ничего не играет!");
@@ -527,13 +547,12 @@ public class Program
         {
             await DeferAsync();
 
-            if (!musicPlayers.ContainsKey(Context.Guild.Id))
+            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
             {
                 await FollowupAsync("❌ Нет активного воспроизведения!");
                 return;
             }
 
-            var player = musicPlayers[Context.Guild.Id];
             player.Loop = !player.Loop;
 
             await FollowupAsync(player.Loop ? "🔁 Повтор **включен**" : "➡️ Повтор **выключен**");
@@ -544,13 +563,12 @@ public class Program
         {
             await DeferAsync();
 
-            if (!musicPlayers.ContainsKey(Context.Guild.Id))
+            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
             {
                 await FollowupAsync("❌ Нет активного воспроизведения!");
                 return;
             }
 
-            var player = musicPlayers[Context.Guild.Id];
             var list = player.Queue.ToList();
             
             if (list.Count < 2)
@@ -578,13 +596,12 @@ public class Program
         {
             await DeferAsync();
 
-            if (!musicPlayers.ContainsKey(Context.Guild.Id))
+            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
             {
                 await FollowupAsync("❌ Очередь пуста!");
                 return;
             }
 
-            var player = musicPlayers[Context.Guild.Id];
             var list = player.Queue.ToList();
 
             if (number < 1 || number > list.Count)
@@ -605,13 +622,12 @@ public class Program
         {
             await DeferAsync();
 
-            if (!musicPlayers.ContainsKey(Context.Guild.Id))
+            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
             {
                 await FollowupAsync("❌ Очередь уже пуста!");
                 return;
             }
 
-            var player = musicPlayers[Context.Guild.Id];
             var count = player.Queue.Count;
             player.Queue.Clear();
 
@@ -623,15 +639,15 @@ public class Program
         {
             await DeferAsync();
 
-            if (!musicPlayers.ContainsKey(Context.Guild.Id))
+            if (!musicPlayers.TryGetValue(Context.Guild.Id, out var player))
             {
                 await FollowupAsync("❌ Бот не в голосовом канале!");
                 return;
             }
 
-            var player = musicPlayers[Context.Guild.Id];
             player.Stop();
-            await player.VoiceChannel?.DisconnectAsync();
+            if (player.VoiceChannel != null)
+                await player.VoiceChannel.DisconnectAsync();
 
             await FollowupAsync("👋 Отключился");
         }
