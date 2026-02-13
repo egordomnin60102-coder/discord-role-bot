@@ -16,10 +16,11 @@ jobs:
     - name: 📥 Checkout repository
       uses: actions/checkout@v4
       
-    - name: 🎵 Install FFmpeg
+    - name: 🎵 Install FFmpeg and yt-dlp
       run: |
         sudo apt update
-        sudo apt install -y ffmpeg
+        sudo apt install -y ffmpeg python3-pip
+        pip3 install yt-dlp
         
     - name: ⚙️ Setup .NET 8
       uses: actions/setup-dotnet@v4
