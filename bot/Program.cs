@@ -7,6 +7,8 @@ using YoutubeExplode;
 using YoutubeExplode.Videos.Streams;
 using System.Diagnostics;
 using System.Collections.Concurrent;
+using System.Net.Http;
+using System.Text.Json;
 
 public class Program
 {
@@ -14,6 +16,7 @@ public class Program
     private static InteractionService? interactions;
     private static IServiceProvider? services;
     private static YoutubeClient youtube = new();
+    private static HttpClient httpClient = new();
     
     // Хранилище для очередей и состояний
     private static ConcurrentDictionary<ulong, MusicPlayer> musicPlayers = new();
@@ -170,12 +173,14 @@ public class Program
         public TimeSpan Duration { get; set; }
         public string Thumbnail { get; set; } = "";
         public ulong RequestedBy { get; set; }
+        public string StreamUrl { get; set; } = "";
     }
 
     public class MusicCommands : InteractionModuleBase<SocketInteractionContext>
     {
         private readonly DiscordSocketClient _client;
         private static YoutubeClient youtube = new();
+        private static HttpClient httpClient = new();
 
         public MusicCommands(DiscordSocketClient client)
         {
@@ -202,53 +207,27 @@ public class Program
             
             try
             {
+                await FollowupAsync($"🔍 Ищу: {query}...");
+
                 // Поиск видео
-                string title, url, author, thumbnail;
-                TimeSpan duration;
+                SongInfo song;
 
                 if (Uri.IsWellFormedUriString(query, UriKind.Absolute))
                 {
-                    var video = await youtube.Videos.GetAsync(query);
-                    title = video.Title;
-                    url = video.Url;
-                    author = video.Author?.ChannelTitle ?? "Unknown";
-                    duration = video.Duration ?? TimeSpan.Zero;
-                    thumbnail = video.Thumbnails.FirstOrDefault()?.Url ?? "";
+                    // Прямая ссылка
+                    song = await GetVideoInfo(query);
                 }
                 else
                 {
-                    // Исправление: правильно получаем результаты поиска
-                    var results = new List<YoutubeExplode.Search.VideoSearchResult>();
-                    await foreach (var result in youtube.Search.GetVideosAsync(query))
-                    {
-                        results.Add(result);
-                        if (results.Count >= 1) break; // Берем только первый результат
-                    }
-
-                    var firstVideo = results.FirstOrDefault();
-                    if (firstVideo == null)
-                    {
-                        await FollowupAsync($"❌ Ничего не найдено по запросу: {query}");
-                        return;
-                    }
-                    
-                    var video = await youtube.Videos.GetAsync(firstVideo.Url);
-                    title = video.Title;
-                    url = video.Url;
-                    author = video.Author?.ChannelTitle ?? "Unknown";
-                    duration = video.Duration ?? TimeSpan.Zero;
-                    thumbnail = video.Thumbnails.FirstOrDefault()?.Url ?? "";
+                    // Поиск по названию
+                    song = await SearchVideo(query);
                 }
 
-                var song = new SongInfo
+                if (song == null)
                 {
-                    Title = title,
-                    Url = url,
-                    Author = author,
-                    Duration = duration,
-                    Thumbnail = thumbnail,
-                    RequestedBy = user.Id
-                };
+                    await ModifyOriginalResponseAsync(msg => msg.Content = $"❌ Ничего не найдено по запросу: {query}");
+                    return;
+                }
 
                 if (player.IsPlaying)
                 {
@@ -264,7 +243,11 @@ public class Program
                         .WithThumbnailUrl(song.Thumbnail)
                         .Build();
 
-                    await FollowupAsync(embed: embed);
+                    await ModifyOriginalResponseAsync(msg =>
+                    {
+                        msg.Content = "";
+                        msg.Embed = embed;
+                    });
                 }
                 else
                 {
@@ -272,7 +255,7 @@ public class Program
                     player.TextChannel = Context.Channel as ITextChannel;
                     player.CurrentSong = song;
                     
-                    await FollowupAsync($"🔍 Подключаюсь и начинаю воспроизведение...");
+                    await ModifyOriginalResponseAsync(msg => msg.Content = $"🔍 Подключаюсь и начинаю воспроизведение...");
                     
                     // Запускаем воспроизведение в фоне
                     _ = Task.Run(async () => await PlaySong(player, song));
@@ -292,7 +275,72 @@ public class Program
             }
             catch (Exception ex)
             {
-                await FollowupAsync($"❌ Ошибка: {ex.Message}");
+                await ModifyOriginalResponseAsync(msg => msg.Content = $"❌ Ошибка: {ex.Message}");
+            }
+        }
+
+        private async Task<SongInfo?> GetVideoInfo(string url)
+        {
+            try
+            {
+                var video = await youtube.Videos.GetAsync(url);
+                
+                return new SongInfo
+                {
+                    Title = video.Title,
+                    Url = video.Url,
+                    Author = video.Author?.ChannelTitle ?? "Unknown",
+                    Duration = video.Duration ?? TimeSpan.Zero,
+                    Thumbnail = video.Thumbnails.FirstOrDefault()?.Url ?? "",
+                };
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error getting video: {ex.Message}");
+                return null;
+            }
+        }
+
+        private async Task<SongInfo?> SearchVideo(string query)
+        {
+            try
+            {
+                // Пробуем разные варианты поиска
+                var results = new List<YoutubeExplode.Search.VideoSearchResult>();
+                await foreach (var result in youtube.Search.GetVideosAsync(query))
+                {
+                    results.Add(result);
+                    if (results.Count >= 3) break; // Берем несколько результатов на случай проблем
+                }
+
+                foreach (var searchResult in results)
+                {
+                    try
+                    {
+                        var video = await youtube.Videos.GetAsync(searchResult.Url);
+                        
+                        return new SongInfo
+                        {
+                            Title = video.Title,
+                            Url = video.Url,
+                            Author = video.Author?.ChannelTitle ?? "Unknown",
+                            Duration = video.Duration ?? TimeSpan.Zero,
+                            Thumbnail = video.Thumbnails.FirstOrDefault()?.Url ?? "",
+                        };
+                    }
+                    catch
+                    {
+                        // Если это видео недоступно, пробуем следующее
+                        continue;
+                    }
+                }
+
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error searching: {ex.Message}");
+                return null;
             }
         }
 
@@ -304,13 +352,27 @@ public class Program
                 player.PlaybackCts = new CancellationTokenSource();
 
                 // Получаем аудио поток
-                var streamManifest = await youtube.Videos.Streams.GetManifestAsync(song.Url);
-                var audioStream = streamManifest.GetAudioOnlyStreams().TryGetWithHighestBitrate();
+                IStreamInfo? audioStream = null;
+                
+                try
+                {
+                    var streamManifest = await youtube.Videos.Streams.GetManifestAsync(song.Url);
+                    audioStream = streamManifest.GetAudioOnlyStreams().TryGetWithHighestBitrate();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error getting stream: {ex.Message}");
+                    await player.TextChannel?.SendMessageAsync($"❌ Не удалось получить аудио поток для этого видео. Попробуйте другое видео.");
+                    player.IsPlaying = false;
+                    await HandleTrackEnd(player);
+                    return;
+                }
                 
                 if (audioStream == null)
                 {
-                    await player.TextChannel?.SendMessageAsync("❌ Не удалось получить аудио поток");
+                    await player.TextChannel?.SendMessageAsync("❌ Не удалось получить аудио поток. Возможно, видео недоступно.");
                     player.IsPlaying = false;
+                    await HandleTrackEnd(player);
                     return;
                 }
 
@@ -351,8 +413,12 @@ public class Program
                     try
                     {
                         using var audio = await youtube.Videos.Streams.GetAsync(audioStream);
-                        await audio.CopyToAsync(ffmpeg.StandardInput.BaseStream);
+                        await audio.CopyToAsync(ffmpeg.StandardInput.BaseStream, player.PlaybackCts.Token);
                         ffmpeg.StandardInput.Close();
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        Console.WriteLine("Download cancelled");
                     }
                     catch (Exception ex)
                     {
@@ -365,9 +431,16 @@ public class Program
                 {
                     var discordStream = player.AudioClient.CreatePCMStream(AudioApplication.Mixed, null, 128 * 1024);
                     
-                    // Передаем аудио в Discord
-                    await ffmpeg.StandardOutput.BaseStream.CopyToAsync(discordStream, player.PlaybackCts.Token);
-                    await discordStream.FlushAsync();
+                    try
+                    {
+                        // Передаем аудио в Discord
+                        await ffmpeg.StandardOutput.BaseStream.CopyToAsync(discordStream, player.PlaybackCts.Token);
+                        await discordStream.FlushAsync();
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        Console.WriteLine("Playback cancelled");
+                    }
                 }
                 
                 player.IsPlaying = false;
@@ -671,6 +744,11 @@ public class Program
                     "`/remove` - Удалить из очереди\n" +
                     "`/clear` - Очистить очередь\n" +
                     "`/leave` - Отключить", true)
+                .AddField("ℹ️ **Информация**",
+                    "Если видео недоступно, попробуйте:\n" +
+                    "• Использовать другое видео\n" +
+                    "• Написать название по-английски\n" +
+                    "• Добавить 'audio' в запрос", false)
                 .WithFooter("Требуется FFmpeg")
                 .Build();
 
