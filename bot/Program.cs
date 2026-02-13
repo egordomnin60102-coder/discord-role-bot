@@ -1,28 +1,21 @@
 using Discord;
 using Discord.WebSocket;
 using Discord.Interactions;
-using Victoria;
-using Victoria.Enums;
-using Victoria.EventArgs;
-using Victoria.Responses.Search;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Text.RegularExpressions;
+using YoutubeExplode;
+using YoutubeExplode.Videos.Streams;
+using System.Diagnostics;
+using System.Collections.Concurrent;
 
 public class Program
 {
     private static DiscordSocketClient? client;
     private static InteractionService? interactions;
-    private static LavaNode? lavaNode;
     private static IServiceProvider? services;
-    private static Dictionary<ulong, Queue<LavaTrack>> musicQueues = new();
-    private static Dictionary<ulong, bool> loopEnabled = new();
-    private static Dictionary<ulong, int> volumeLevels = new();
+    private static YoutubeClient youtube = new();
+    
+    // Хранилище для очередей и состояний
+    private static ConcurrentDictionary<ulong, MusicPlayer> musicPlayers = new();
 
     public static async Task Main(string[] args)
     {
@@ -42,32 +35,19 @@ public class Program
         Console.WriteLine("✅ Token received");
         Console.WriteLine("🚀 Starting bot...");
 
-        // Настраиваем сервисы
         services = new ServiceCollection()
             .AddSingleton<DiscordSocketClient>()
             .AddSingleton(x => new InteractionService(x.GetRequiredService<DiscordSocketClient>()))
-            .AddSingleton<LavaNode>()
-            .AddLogging(builder => builder.AddConsole())
             .BuildServiceProvider();
 
         client = services.GetRequiredService<DiscordSocketClient>();
         interactions = services.GetRequiredService<InteractionService>();
-        lavaNode = services.GetRequiredService<LavaNode>();
 
-        // Настройка клиента
         client.Log += LogMessage;
         client.Ready += ReadyAsync;
         client.InteractionCreated += InteractionCreatedAsync;
         client.UserVoiceStateUpdated += UserVoiceStateUpdatedAsync;
 
-        // Настройка Lavalink
-        lavaNode.OnLog += LogMessage;
-        lavaNode.OnTrackEnded += TrackEndedAsync;
-        lavaNode.OnTrackStarted += TrackStartedAsync;
-        lavaNode.OnTrackException += TrackExceptionAsync;
-        lavaNode.OnTrackStuck += TrackStuckAsync;
-
-        // Вход в Discord
         await client.LoginAsync(TokenType.Bot, token);
         await client.StartAsync();
 
@@ -86,24 +66,11 @@ public class Program
 
     private static async Task ReadyAsync()
     {
-        if (client == null || lavaNode == null) return;
+        if (client == null) return;
         
         Console.WriteLine($"\n🎉 BOT READY: {client.CurrentUser}");
         Console.WriteLine($"🏰 Servers: {client.Guilds.Count}");
 
-        // Подключаемся к Lavalink
-        try
-        {
-            await lavaNode.ConnectAsync();
-            Console.WriteLine("✅ Connected to Lavalink!");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"❌ Failed to connect to Lavalink: {ex.Message}");
-            Console.WriteLine("Make sure Lavalink is running!");
-        }
-
-        // Регистрируем команды
         await interactions.AddModuleAsync<MusicCommands>(services);
         await interactions.RegisterCommandsGloballyAsync();
         Console.WriteLine("✅ Slash commands registered globally!");
@@ -111,15 +78,7 @@ public class Program
         foreach (var guild in client.Guilds)
         {
             Console.WriteLine($"   • {guild.Name} (ID: {guild.Id})");
-            
-            if (!musicQueues.ContainsKey(guild.Id))
-                musicQueues[guild.Id] = new Queue<LavaTrack>();
-            
-            if (!loopEnabled.ContainsKey(guild.Id))
-                loopEnabled[guild.Id] = false;
-                
-            if (!volumeLevels.ContainsKey(guild.Id))
-                volumeLevels[guild.Id] = 50;
+            musicPlayers[guild.Id] = new MusicPlayer();
         }
 
         Console.WriteLine("===========================================");
@@ -135,29 +94,27 @@ public class Program
 
     private static async Task UserVoiceStateUpdatedAsync(SocketUser user, SocketVoiceState oldState, SocketVoiceState newState)
     {
-        if (user.IsBot || client == null) return;
+        if (user.IsBot) return;
 
+        // Проверяем, остались ли люди в канале
         if (oldState.VoiceChannel != null && newState.VoiceChannel == null)
         {
             var guild = (oldState.VoiceChannel as SocketGuildChannel)?.Guild;
             if (guild == null) return;
 
             var voiceChannel = oldState.VoiceChannel;
-            if (voiceChannel.ConnectedUsers.Count == 1 && voiceChannel.ConnectedUsers.Any(x => x.Id == client.CurrentUser.Id))
+            if (voiceChannel.ConnectedUsers.Count == 1 && voiceChannel.ConnectedUsers.Any(x => x.Id == client?.CurrentUser.Id))
             {
                 _ = Task.Delay(30000).ContinueWith(async _ =>
                 {
                     var currentChannel = guild.VoiceChannels.FirstOrDefault(x => x.Id == voiceChannel.Id);
                     if (currentChannel != null && currentChannel.ConnectedUsers.Count == 1 && 
-                        currentChannel.ConnectedUsers.Any(x => x.Id == client.CurrentUser.Id) && lavaNode != null)
+                        currentChannel.ConnectedUsers.Any(x => x.Id == client?.CurrentUser.Id))
                     {
-                        var player = lavaNode.GetPlayer(guild);
-                        if (player != null)
+                        await currentChannel.DisconnectAsync();
+                        if (musicPlayers.ContainsKey(guild.Id))
                         {
-                            await player.StopAsync();
-                            if (player.TextChannel != null)
-                                await player.TextChannel.SendMessageAsync("⏰ Отключаюсь из-за отсутствия слушателей!");
-                            await lavaNode.LeaveAsync(voiceChannel);
+                            musicPlayers[guild.Id].Stop();
                         }
                     }
                 });
@@ -165,237 +122,275 @@ public class Program
         }
     }
 
-    private static async Task TrackEndedAsync(TrackEndedEventArg args)
+    public class MusicPlayer
     {
-        if (args.Reason == TrackEndReason.LoadFailed || args.Reason == TrackEndReason.Cleanup)
-            return;
+        public Queue<SongInfo> Queue { get; set; } = new();
+        public bool IsPlaying { get; set; } = false;
+        public bool IsPaused { get; set; } = false;
+        public bool Loop { get; set; } = false;
+        public int Volume { get; set; } = 50;
+        public IVoiceChannel? VoiceChannel { get; set; }
+        public ITextChannel? TextChannel { get; set; }
+        public Process? FfmpegProcess { get; set; }
+        public IAudioClient? AudioClient { get; set; }
+        public SongInfo? CurrentSong { get; set; }
+        public CancellationTokenSource? PlaybackCts { get; set; }
 
-        var guild = args.Player.VoiceChannel.Guild;
-        
-        if (loopEnabled.ContainsKey(guild.Id) && loopEnabled[guild.Id] && args.Reason != TrackEndReason.Replaced)
+        public void Stop()
         {
-            await args.Player.PlayAsync(args.Track);
-            return;
-        }
-
-        if (musicQueues.ContainsKey(guild.Id) && musicQueues[guild.Id].Count > 0)
-        {
-            var nextTrack = musicQueues[guild.Id].Dequeue();
-            await args.Player.PlayAsync(nextTrack);
-            
-            var embed = new EmbedBuilder()
-                .WithTitle("🎵 Сейчас играет")
-                .WithDescription($"[{nextTrack.Title}]({nextTrack.Url})")
-                .WithColor(Color.Green)
-                .AddField("Автор", nextTrack.Author, true)
-                .AddField("Длительность", FormatDuration(nextTrack.Duration), true)
-                .AddField("Запросил", $"<@{nextTrack.Context}>", true)
-                .WithThumbnailUrl(await nextTrack.FetchArtworkAsync())
-                .Build();
-
-            if (args.Player.TextChannel != null)
-                await args.Player.TextChannel.SendMessageAsync(embed: embed);
-        }
-        else
-        {
-            if (args.Player.TextChannel != null)
-                await args.Player.TextChannel.SendMessageAsync("📭 Очередь закончилась! Используйте `/play` чтобы добавить новые треки.");
-            
-            _ = Task.Delay(60000).ContinueWith(async _ =>
-            {
-                if (musicQueues[guild.Id].Count == 0 && args.Player.PlayerState == PlayerState.Stopped)
-                {
-                    await args.Player.StopAsync();
-                    await lavaNode?.LeaveAsync(args.Player.VoiceChannel);
-                }
-            });
+            IsPlaying = false;
+            IsPaused = false;
+            CurrentSong = null;
+            FfmpegProcess?.Kill();
+            FfmpegProcess?.Dispose();
+            FfmpegProcess = null;
+            PlaybackCts?.Cancel();
+            PlaybackCts?.Dispose();
+            PlaybackCts = null;
+            Queue.Clear();
         }
     }
 
-    private static async Task TrackStartedAsync(TrackStartedEventArg args)
+    public class SongInfo
     {
-        Console.WriteLine($"🎵 Now playing: {args.Track.Title} in {args.Player.VoiceChannel.Guild.Name}");
+        public string Title { get; set; } = "";
+        public string Url { get; set; } = "";
+        public string Author { get; set; } = "";
+        public TimeSpan Duration { get; set; }
+        public string Thumbnail { get; set; } = "";
+        public ulong RequestedBy { get; set; }
     }
 
-    private static async Task TrackExceptionAsync(TrackExceptionEventArg args)
-    {
-        Console.WriteLine($"❌ Track exception: {args.Exception.Message}");
-        if (args.Player.TextChannel != null)
-            await args.Player.TextChannel.SendMessageAsync($"❌ Ошибка воспроизведения: {args.Exception.Message}");
-    }
-
-    private static async Task TrackStuckAsync(TrackStuckEventArg args)
-    {
-        Console.WriteLine($"❌ Track stuck: {args.Track.Title}");
-        if (args.Player.TextChannel != null)
-            await args.Player.TextChannel.SendMessageAsync($"❌ Трек завис, пропускаю...");
-        
-        if (musicQueues.ContainsKey(args.Player.VoiceChannel.Guild.Id) && musicQueues[args.Player.VoiceChannel.Guild.Id].Count > 0)
-        {
-            var nextTrack = musicQueues[args.Player.VoiceChannel.Guild.Id].Dequeue();
-            await args.Player.PlayAsync(nextTrack);
-        }
-    }
-
-    private static string FormatDuration(TimeSpan duration)
-    {
-        if (duration.Hours > 0)
-            return $"{duration.Hours}:{duration.Minutes:D2}:{duration.Seconds:D2}";
-        else
-            return $"{duration.Minutes}:{duration.Seconds:D2}";
-    }
-
-    // === МУЗЫКАЛЬНЫЕ КОМАНДЫ ===
     public class MusicCommands : InteractionModuleBase<SocketInteractionContext>
     {
-        private readonly LavaNode _lavaNode;
         private readonly DiscordSocketClient _client;
+        private static YoutubeClient youtube = new();
 
-        public MusicCommands(LavaNode lavaNode, DiscordSocketClient client)
+        public MusicCommands(DiscordSocketClient client)
         {
-            _lavaNode = lavaNode;
             _client = client;
         }
 
-        [SlashCommand("play", "Воспроизвести музыку (по названию или ссылке)")]
+        [SlashCommand("play", "Воспроизвести музыку с YouTube")]
         public async Task PlayCommand(
-            [Summary("запрос", "Название песни или ссылка на YouTube/Spotify")] string query)
+            [Summary("запрос", "Название песни или ссылка на YouTube")] string query)
         {
             await DeferAsync();
 
             var user = Context.User as SocketGuildUser;
-            if (user == null || user.VoiceChannel == null)
+            if (user?.VoiceChannel == null)
             {
                 await FollowupAsync("❌ Вы должны находиться в голосовом канале!", ephemeral: true);
                 return;
             }
 
-            if (!_lavaNode.HasPlayer(Context.Guild))
+            if (!musicPlayers.ContainsKey(Context.Guild.Id))
+                musicPlayers[Context.Guild.Id] = new MusicPlayer();
+
+            var player = musicPlayers[Context.Guild.Id];
+            
+            try
             {
-                try
+                // Поиск видео
+                VideoSearchResult video;
+                if (Uri.IsWellFormedUriString(query, UriKind.Absolute))
                 {
-                    await _lavaNode.JoinAsync(user.VoiceChannel, Context.Channel as ITextChannel);
+                    var v = await youtube.Videos.GetAsync(query);
+                    video = new VideoSearchResult
+                    {
+                        Title = v.Title,
+                        Url = v.Url,
+                        Author = v.Author.ChannelTitle,
+                        Duration = v.Duration ?? TimeSpan.Zero,
+                        Thumbnail = v.Thumbnails.FirstOrDefault()?.Url ?? ""
+                    };
                 }
-                catch (Exception ex)
+                else
                 {
-                    await FollowupAsync($"❌ Не удалось подключиться: {ex.Message}");
-                    return;
+                    var results = await youtube.Search.GetVideosAsync(query);
+                    var first = results.FirstOrDefault();
+                    if (first == null)
+                    {
+                        await FollowupAsync($"❌ Ничего не найдено по запросу: {query}");
+                        return;
+                    }
+                    
+                    var v = await youtube.Videos.GetAsync(first.Url);
+                    video = new VideoSearchResult
+                    {
+                        Title = v.Title,
+                        Url = v.Url,
+                        Author = v.Author.ChannelTitle,
+                        Duration = v.Duration ?? TimeSpan.Zero,
+                        Thumbnail = v.Thumbnails.FirstOrDefault()?.Url ?? ""
+                    };
+                }
+
+                var song = new SongInfo
+                {
+                    Title = video.Title,
+                    Url = video.Url,
+                    Author = video.Author,
+                    Duration = video.Duration,
+                    Thumbnail = video.Thumbnail,
+                    RequestedBy = user.Id
+                };
+
+                if (player.IsPlaying)
+                {
+                    player.Queue.Enqueue(song);
+                    
+                    var embed = new EmbedBuilder()
+                        .WithTitle("➕ Добавлено в очередь")
+                        .WithDescription($"[{song.Title}]({song.Url})")
+                        .WithColor(Color.Blue)
+                        .AddField("Автор", song.Author, true)
+                        .AddField("Длительность", FormatDuration(song.Duration), true)
+                        .AddField("Позиция", player.Queue.Count, true)
+                        .WithThumbnailUrl(song.Thumbnail)
+                        .Build();
+
+                    await FollowupAsync(embed: embed);
+                }
+                else
+                {
+                    player.VoiceChannel = user.VoiceChannel;
+                    player.TextChannel = Context.Channel as ITextChannel;
+                    player.CurrentSong = song;
+                    
+                    await FollowupAsync($"🔍 Подключаюсь и начинаю воспроизведение...");
+                    
+                    await PlaySong(player, song);
+                    
+                    var embed = new EmbedBuilder()
+                        .WithTitle("🎵 Сейчас играет")
+                        .WithDescription($"[{song.Title}]({song.Url})")
+                        .WithColor(Color.Green)
+                        .AddField("Автор", song.Author, true)
+                        .AddField("Длительность", FormatDuration(song.Duration), true)
+                        .AddField("Запросил", user.Mention, true)
+                        .WithThumbnailUrl(song.Thumbnail)
+                        .Build();
+
+                    await Context.Channel.SendMessageAsync(embed: embed);
                 }
             }
-
-            var player = _lavaNode.GetPlayer(Context.Guild);
-            if (player == null)
+            catch (Exception ex)
             {
-                await FollowupAsync("❌ Не удалось получить плеер!");
-                return;
-            }
-
-            SearchResponse searchResponse;
-            if (Uri.IsWellFormedUriString(query, UriKind.Absolute))
-            {
-                searchResponse = await _lavaNode.SearchAsync(SearchType.Direct, query);
-            }
-            else
-            {
-                searchResponse = await _lavaNode.SearchYouTubeAsync(query);
-            }
-
-            if (searchResponse.Status == SearchStatus.NoMatches)
-            {
-                await FollowupAsync($"❌ Ничего не найдено по запросу: {query}");
-                return;
-            }
-
-            if (searchResponse.Status == SearchStatus.LoadFailed)
-            {
-                await FollowupAsync($"❌ Не удалось загрузить трек: {searchResponse.Exception?.Message}");
-                return;
-            }
-
-            var tracks = searchResponse.Tracks.ToList();
-            var track = tracks.First();
-            track.Context = user.Id;
-
-            if (player.PlayerState == PlayerState.Playing || player.PlayerState == PlayerState.Paused)
-            {
-                if (!musicQueues.ContainsKey(Context.Guild.Id))
-                    musicQueues[Context.Guild.Id] = new Queue<LavaTrack>();
-
-                musicQueues[Context.Guild.Id].Enqueue(track);
-
-                var embed = new EmbedBuilder()
-                    .WithTitle("➕ Добавлено в очередь")
-                    .WithDescription($"[{track.Title}]({track.Url})")
-                    .WithColor(Color.Blue)
-                    .AddField("Автор", track.Author, true)
-                    .AddField("Длительность", FormatDuration(track.Duration), true)
-                    .AddField("Позиция", musicQueues[Context.Guild.Id].Count, true)
-                    .WithThumbnailUrl(await track.FetchArtworkAsync())
-                    .Build();
-
-                await FollowupAsync(embed: embed);
-            }
-            else
-            {
-                await player.PlayAsync(track);
-                
-                var embed = new EmbedBuilder()
-                    .WithTitle("🎵 Сейчас играет")
-                    .WithDescription($"[{track.Title}]({track.Url})")
-                    .WithColor(Color.Green)
-                    .AddField("Автор", track.Author, true)
-                    .AddField("Длительность", FormatDuration(track.Duration), true)
-                    .AddField("Запросил", user.Mention, true)
-                    .WithThumbnailUrl(await track.FetchArtworkAsync())
-                    .Build();
-
-                await FollowupAsync(embed: embed);
+                await FollowupAsync($"❌ Ошибка: {ex.Message}");
             }
         }
 
-        [SlashCommand("search", "Поиск и выбор из нескольких результатов")]
-        public async Task SearchCommand(
-            [Summary("запрос", "Название для поиска")] string query)
+        private async Task PlaySong(MusicPlayer player, SongInfo song)
         {
-            await DeferAsync();
-
-            var user = Context.User as SocketGuildUser;
-            if (user == null || user.VoiceChannel == null)
+            try
             {
-                await FollowupAsync("❌ Вы должны находиться в голосовом канале!", ephemeral: true);
-                return;
-            }
+                player.IsPlaying = true;
+                player.PlaybackCts = new CancellationTokenSource();
 
-            var searchResponse = await _lavaNode.SearchYouTubeAsync(query);
-            
-            if (searchResponse.Status == SearchStatus.NoMatches)
+                // Получаем аудио поток
+                var streamManifest = await youtube.Videos.Streams.GetManifestAsync(song.Url);
+                var audioStream = streamManifest.GetAudioOnlyStreams().GetWithHighestBitrate();
+                if (audioStream == null)
+                {
+                    await player.TextChannel?.SendMessageAsync("❌ Не удалось получить аудио поток");
+                    player.IsPlaying = false;
+                    return;
+                }
+
+                // Подключаемся к голосовому каналу
+                player.AudioClient = await player.VoiceChannel?.ConnectAsync();
+                
+                // Создаем FFmpeg процесс для конвертации
+                var ffmpeg = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "ffmpeg",
+                    Arguments = $"-i pipe:0 -ac 2 -f s16le -ar 48000 pipe:1",
+                    RedirectStandardInput = true,
+                    RedirectStandardOutput = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                });
+
+                if (ffmpeg == null)
+                {
+                    await player.TextChannel?.SendMessageAsync("❌ FFmpeg не установлен");
+                    player.IsPlaying = false;
+                    return;
+                }
+
+                player.FfmpegProcess = ffmpeg;
+
+                // Скачиваем и передаем в FFmpeg
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        using var audio = await youtube.Videos.Streams.GetAsync(audioStream);
+                        await audio.CopyToAsync(ffmpeg.StandardInput.BaseStream);
+                        ffmpeg.StandardInput.Close();
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error downloading: {ex.Message}");
+                    }
+                });
+
+                // Создаем поток для Discord
+                var discordStream = player.AudioClient.CreatePCMStream(AudioApplication.Mixed, null, 128 * 1024);
+                
+                // Передаем аудио в Discord
+                await ffmpeg.StandardOutput.BaseStream.CopyToAsync(discordStream, player.PlaybackCts.Token);
+                await discordStream.FlushAsync();
+                player.IsPlaying = false;
+
+                // После окончания трека
+                await HandleTrackEnd(player);
+            }
+            catch (Exception ex)
             {
-                await FollowupAsync($"❌ Ничего не найдено по запросу: {query}");
-                return;
+                Console.WriteLine($"Error playing: {ex.Message}");
+                player.IsPlaying = false;
             }
+        }
 
-            var tracks = searchResponse.Tracks.Take(5).ToList();
-            var selectMenu = new SelectMenuBuilder()
-                .WithPlaceholder("Выберите трек")
-                .WithCustomId("track_select")
-                .WithMinValues(1)
-                .WithMaxValues(1);
-
-            for (int i = 0; i < tracks.Count; i++)
+        private async Task HandleTrackEnd(MusicPlayer player)
+        {
+            if (player.Loop && player.CurrentSong != null)
             {
-                var track = tracks[i];
-                selectMenu.AddOption(
-                    $"{i + 1}. {Truncate(track.Title, 50)}",
-                    track.Url,
-                    $"{track.Author} • {FormatDuration(track.Duration)}"
-                );
+                await PlaySong(player, player.CurrentSong);
             }
+            else if (player.Queue.Count > 0)
+            {
+                player.CurrentSong = player.Queue.Dequeue();
+                await PlaySong(player, player.CurrentSong);
+                
+                var embed = new EmbedBuilder()
+                    .WithTitle("🎵 Сейчас играет")
+                    .WithDescription($"[{player.CurrentSong.Title}]({player.CurrentSong.Url})")
+                    .WithColor(Color.Green)
+                    .AddField("Автор", player.CurrentSong.Author, true)
+                    .AddField("Длительность", FormatDuration(player.CurrentSong.Duration), true)
+                    .AddField("Запросил", $"<@{player.CurrentSong.RequestedBy}>", true)
+                    .WithThumbnailUrl(player.CurrentSong.Thumbnail)
+                    .Build();
 
-            var component = new ComponentBuilder()
-                .WithSelectMenu(selectMenu)
-                .Build();
-
-            await FollowupAsync("🔍 **Результаты поиска:**", components: component);
+                await player.TextChannel?.SendMessageAsync(embed: embed);
+            }
+            else
+            {
+                await player.TextChannel?.SendMessageAsync("📭 Очередь закончилась!");
+                player.CurrentSong = null;
+                
+                // Отключаемся через минуту
+                _ = Task.Delay(60000).ContinueWith(async _ =>
+                {
+                    if (player.Queue.Count == 0 && !player.IsPlaying)
+                    {
+                        await player.VoiceChannel?.DisconnectAsync();
+                    }
+                });
+            }
         }
 
         [SlashCommand("skip", "Пропустить текущий трек")]
@@ -403,47 +398,41 @@ public class Program
         {
             await DeferAsync();
 
-            if (!_lavaNode.HasPlayer(Context.Guild))
+            if (!musicPlayers.ContainsKey(Context.Guild.Id))
             {
-                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                await FollowupAsync("❌ Нет активного воспроизведения!");
                 return;
             }
 
-            var player = _lavaNode.GetPlayer(Context.Guild);
-            var currentTrack = player.Track;
+            var player = musicPlayers[Context.Guild.Id];
+            if (!player.IsPlaying || player.CurrentSong == null)
+            {
+                await FollowupAsync("❌ Сейчас ничего не играет!");
+                return;
+            }
 
-            if (musicQueues.ContainsKey(Context.Guild.Id) && musicQueues[Context.Guild.Id].Count > 0)
-            {
-                var nextTrack = musicQueues[Context.Guild.Id].Dequeue();
-                await player.PlayAsync(nextTrack);
-                
-                await FollowupAsync($"⏭️ Пропущен: **{currentTrack.Title}**\n🎵 Сейчас играет: **{nextTrack.Title}**");
-            }
-            else
-            {
-                await player.StopAsync();
-                await FollowupAsync($"⏹️ Остановлено: **{currentTrack.Title}**");
-            }
+            var skipped = player.CurrentSong;
+            player.PlaybackCts?.Cancel();
+
+            await FollowupAsync($"⏭️ Пропущен: **{skipped.Title}**");
         }
 
-        [SlashCommand("stop", "Остановить воспроизведение и очистить очередь")]
+        [SlashCommand("stop", "Остановить воспроизведение")]
         public async Task StopCommand()
         {
             await DeferAsync();
 
-            if (!_lavaNode.HasPlayer(Context.Guild))
+            if (!musicPlayers.ContainsKey(Context.Guild.Id))
             {
-                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                await FollowupAsync("❌ Нет активного воспроизведения!");
                 return;
             }
 
-            var player = _lavaNode.GetPlayer(Context.Guild);
-            await player.StopAsync();
-            
-            if (musicQueues.ContainsKey(Context.Guild.Id))
-                musicQueues[Context.Guild.Id].Clear();
+            var player = musicPlayers[Context.Guild.Id];
+            player.Stop();
+            await player.VoiceChannel?.DisconnectAsync();
 
-            await FollowupAsync("⏹️ Воспроизведение остановлено, очередь очищена");
+            await FollowupAsync("⏹️ Воспроизведение остановлено");
         }
 
         [SlashCommand("pause", "Поставить на паузу")]
@@ -451,69 +440,45 @@ public class Program
         {
             await DeferAsync();
 
-            if (!_lavaNode.HasPlayer(Context.Guild))
+            if (!musicPlayers.ContainsKey(Context.Guild.Id))
             {
-                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                await FollowupAsync("❌ Нет активного воспроизведения!");
                 return;
             }
 
-            var player = _lavaNode.GetPlayer(Context.Guild);
-            
-            if (player.PlayerState == PlayerState.Paused)
-            {
-                await FollowupAsync("⏸️ Уже на паузе!");
-                return;
-            }
-
-            await player.PauseAsync();
-            await FollowupAsync("⏸️ Воспроизведение приостановлено");
+            var player = musicPlayers[Context.Guild.Id];
+            // В этой упрощенной версии пауза не поддерживается
+            await FollowupAsync("⏸️ Функция паузы временно недоступна");
         }
 
-        [SlashCommand("resume", "Возобновить воспроизведение")]
+        [SlashCommand("resume", "Продолжить воспроизведение")]
         public async Task ResumeCommand()
         {
             await DeferAsync();
-
-            if (!_lavaNode.HasPlayer(Context.Guild))
-            {
-                await FollowupAsync("❌ Бот не находится в голосовом канале!");
-                return;
-            }
-
-            var player = _lavaNode.GetPlayer(Context.Guild);
-            
-            if (player.PlayerState != PlayerState.Paused)
-            {
-                await FollowupAsync("▶️ Уже играет!");
-                return;
-            }
-
-            await player.ResumeAsync();
-            await FollowupAsync("▶️ Воспроизведение возобновлено");
+            await FollowupAsync("▶️ Функция продолжения временно недоступна");
         }
 
-        [SlashCommand("queue", "Показать текущую очередь")]
+        [SlashCommand("queue", "Показать очередь")]
         public async Task QueueCommand()
         {
             await DeferAsync();
 
-            if (!_lavaNode.HasPlayer(Context.Guild))
-            {
-                await FollowupAsync("❌ Бот не находится в голосовом канале!");
-                return;
-            }
-
-            var player = _lavaNode.GetPlayer(Context.Guild);
-            
-            if (!musicQueues.ContainsKey(Context.Guild.Id) || musicQueues[Context.Guild.Id].Count == 0)
+            if (!musicPlayers.ContainsKey(Context.Guild.Id))
             {
                 await FollowupAsync("📭 Очередь пуста!");
                 return;
             }
 
-            var queueList = musicQueues[Context.Guild.Id].ToList();
-            var description = "";
+            var player = musicPlayers[Context.Guild.Id];
+            var queueList = player.Queue.ToList();
 
+            if (queueList.Count == 0 && player.CurrentSong == null)
+            {
+                await FollowupAsync("📭 Очередь пуста!");
+                return;
+            }
+
+            var description = "";
             for (int i = 0; i < Math.Min(queueList.Count, 10); i++)
             {
                 var track = queueList[i];
@@ -526,12 +491,16 @@ public class Program
             }
 
             var embed = new EmbedBuilder()
-                .WithTitle("📜 Очередь воспроизведения")
+                .WithTitle("📜 Очередь")
                 .WithDescription(description)
                 .WithColor(Color.Blue)
-                .AddField("Сейчас играет", $"[{player.Track.Title}]({player.Track.Url}) [{FormatDuration(player.Track.Duration)}]")
                 .WithFooter($"Всего треков: {queueList.Count}")
                 .Build();
+
+            if (player.CurrentSong != null)
+            {
+                embed.AddField("Сейчас играет", $"[{player.CurrentSong.Title}]({player.CurrentSong.Url}) [{FormatDuration(player.CurrentSong.Duration)}]");
+            }
 
             await FollowupAsync(embed: embed);
         }
@@ -541,56 +510,47 @@ public class Program
         {
             await DeferAsync();
 
-            if (!_lavaNode.HasPlayer(Context.Guild))
+            if (!musicPlayers.ContainsKey(Context.Guild.Id))
             {
-                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                await FollowupAsync("❌ Сейчас ничего не играет!");
                 return;
             }
 
-            var player = _lavaNode.GetPlayer(Context.Guild);
-            var track = player.Track;
-            var position = player.PlaybackPosition;
-
-            var progress = CreateProgressBar(position, track.Duration);
+            var player = musicPlayers[Context.Guild.Id];
+            if (player.CurrentSong == null)
+            {
+                await FollowupAsync("❌ Сейчас ничего не играет!");
+                return;
+            }
 
             var embed = new EmbedBuilder()
                 .WithTitle("🎵 Сейчас играет")
-                .WithDescription($"[{track.Title}]({track.Url})")
+                .WithDescription($"[{player.CurrentSong.Title}]({player.CurrentSong.Url})")
                 .WithColor(Color.Green)
-                .AddField("Автор", track.Author, true)
-                .AddField("Длительность", $"{FormatDuration(position)} / {FormatDuration(track.Duration)}", true)
-                .AddField("Запросил", $"<@{track.Context}>", true)
-                .AddField("Прогресс", progress, false)
-                .WithThumbnailUrl(await track.FetchArtworkAsync())
+                .AddField("Автор", player.CurrentSong.Author, true)
+                .AddField("Длительность", FormatDuration(player.CurrentSong.Duration), true)
+                .AddField("Запросил", $"<@{player.CurrentSong.RequestedBy}>", true)
+                .WithThumbnailUrl(player.CurrentSong.Thumbnail)
                 .Build();
 
             await FollowupAsync(embed: embed);
         }
 
-        [SlashCommand("loop", "Включить/выключить повтор трека")]
+        [SlashCommand("loop", "Включить/выключить повтор")]
         public async Task LoopCommand()
         {
             await DeferAsync();
 
-            if (!_lavaNode.HasPlayer(Context.Guild))
+            if (!musicPlayers.ContainsKey(Context.Guild.Id))
             {
-                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                await FollowupAsync("❌ Нет активного воспроизведения!");
                 return;
             }
 
-            if (!loopEnabled.ContainsKey(Context.Guild.Id))
-                loopEnabled[Context.Guild.Id] = false;
+            var player = musicPlayers[Context.Guild.Id];
+            player.Loop = !player.Loop;
 
-            loopEnabled[Context.Guild.Id] = !loopEnabled[Context.Guild.Id];
-
-            if (loopEnabled[Context.Guild.Id])
-            {
-                await FollowupAsync("🔁 Повтор трека **включен**");
-            }
-            else
-            {
-                await FollowupAsync("➡️ Повтор трека **выключен**");
-            }
+            await FollowupAsync(player.Loop ? "🔁 Повтор **включен**" : "➡️ Повтор **выключен**");
         }
 
         [SlashCommand("shuffle", "Перемешать очередь")]
@@ -598,15 +558,22 @@ public class Program
         {
             await DeferAsync();
 
-            if (!musicQueues.ContainsKey(Context.Guild.Id) || musicQueues[Context.Guild.Id].Count < 2)
+            if (!musicPlayers.ContainsKey(Context.Guild.Id))
             {
-                await FollowupAsync("❌ Недостаточно треков в очереди для перемешивания!");
+                await FollowupAsync("❌ Нет активного воспроизведения!");
                 return;
             }
 
-            var list = musicQueues[Context.Guild.Id].ToList();
-            var random = new Random();
+            var player = musicPlayers[Context.Guild.Id];
+            var list = player.Queue.ToList();
             
+            if (list.Count < 2)
+            {
+                await FollowupAsync("❌ Недостаточно треков в очереди!");
+                return;
+            }
+
+            var random = new Random();
             for (int i = list.Count - 1; i > 0; i--)
             {
                 int j = random.Next(i + 1);
@@ -615,162 +582,94 @@ public class Program
                 list[j] = temp;
             }
 
-            musicQueues[Context.Guild.Id] = new Queue<LavaTrack>(list);
+            player.Queue = new Queue<SongInfo>(list);
             await FollowupAsync("🔀 Очередь перемешана!");
         }
 
         [SlashCommand("remove", "Удалить трек из очереди")]
         public async Task RemoveCommand(
-            [Summary("номер", "Номер трека в очереди")] int number)
+            [Summary("номер", "Номер трека")] int number)
         {
             await DeferAsync();
 
-            if (!musicQueues.ContainsKey(Context.Guild.Id) || musicQueues[Context.Guild.Id].Count == 0)
+            if (!musicPlayers.ContainsKey(Context.Guild.Id))
             {
                 await FollowupAsync("❌ Очередь пуста!");
                 return;
             }
 
-            if (number < 1 || number > musicQueues[Context.Guild.Id].Count)
+            var player = musicPlayers[Context.Guild.Id];
+            var list = player.Queue.ToList();
+
+            if (number < 1 || number > list.Count)
             {
-                await FollowupAsync($"❌ Неверный номер! Всего треков: {musicQueues[Context.Guild.Id].Count}");
+                await FollowupAsync($"❌ Неверный номер! Всего треков: {list.Count}");
                 return;
             }
 
-            var list = musicQueues[Context.Guild.Id].ToList();
             var removed = list[number - 1];
             list.RemoveAt(number - 1);
-            musicQueues[Context.Guild.Id] = new Queue<LavaTrack>(list);
+            player.Queue = new Queue<SongInfo>(list);
 
-            await FollowupAsync($"✅ Удален трек #{number}: **{removed.Title}**");
+            await FollowupAsync($"✅ Удален: **{removed.Title}**");
         }
 
-        [SlashCommand("clear", "Очистить всю очередь")]
-        public async Task ClearQueueCommand()
+        [SlashCommand("clear", "Очистить очередь")]
+        public async Task ClearCommand()
         {
             await DeferAsync();
 
-            if (!musicQueues.ContainsKey(Context.Guild.Id) || musicQueues[Context.Guild.Id].Count == 0)
+            if (!musicPlayers.ContainsKey(Context.Guild.Id))
             {
                 await FollowupAsync("❌ Очередь уже пуста!");
                 return;
             }
 
-            var count = musicQueues[Context.Guild.Id].Count;
-            musicQueues[Context.Guild.Id].Clear();
+            var player = musicPlayers[Context.Guild.Id];
+            var count = player.Queue.Count;
+            player.Queue.Clear();
 
             await FollowupAsync($"🧹 Очередь очищена (удалено {count} треков)");
         }
 
-        [SlashCommand("volume", "Изменить громкость")]
-        public async Task VolumeCommand(
-            [Summary("уровень", "Громкость от 0 до 100")] int volume)
-        {
-            await DeferAsync();
-
-            if (!_lavaNode.HasPlayer(Context.Guild))
-            {
-                await FollowupAsync("❌ Бот не находится в голосовом канале!");
-                return;
-            }
-
-            if (volume < 0 || volume > 100)
-            {
-                await FollowupAsync("❌ Громкость должна быть от 0 до 100!");
-                return;
-            }
-
-            var player = _lavaNode.GetPlayer(Context.Guild);
-            await player.UpdateVolumeAsync((ushort)volume);
-            
-            volumeLevels[Context.Guild.Id] = volume;
-            
-            await FollowupAsync($"🔊 Громкость установлена на {volume}%");
-        }
-
-        [SlashCommand("seek", "Перемотать на указанное время")]
-        public async Task SeekCommand(
-            [Summary("время", "Время в формате мм:сс (например 1:30)")] string time)
-        {
-            await DeferAsync();
-
-            if (!_lavaNode.HasPlayer(Context.Guild))
-            {
-                await FollowupAsync("❌ Бот не находится в голосовом канале!");
-                return;
-            }
-
-            if (!TimeSpan.TryParse($"00:{time}", out var seekTime))
-            {
-                await FollowupAsync("❌ Неверный формат времени! Используйте мм:сс (например 1:30)");
-                return;
-            }
-
-            var player = _lavaNode.GetPlayer(Context.Guild);
-            
-            if (seekTime > player.Track.Duration)
-            {
-                await FollowupAsync($"❌ Время не может превышать длительность трека ({FormatDuration(player.Track.Duration)})!");
-                return;
-            }
-
-            await player.SeekAsync(seekTime);
-            await FollowupAsync($"⏩ Перемотано на {FormatDuration(seekTime)}");
-        }
-
-        [SlashCommand("leave", "Отключить бота от голосового канала")]
+        [SlashCommand("leave", "Отключить бота")]
         public async Task LeaveCommand()
         {
             await DeferAsync();
 
-            if (!_lavaNode.HasPlayer(Context.Guild))
+            if (!musicPlayers.ContainsKey(Context.Guild.Id))
             {
-                await FollowupAsync("❌ Бот не находится в голосовом канале!");
+                await FollowupAsync("❌ Бот не в голосовом канале!");
                 return;
             }
 
-            var player = _lavaNode.GetPlayer(Context.Guild);
-            await player.StopAsync();
-            
-            if (musicQueues.ContainsKey(Context.Guild.Id))
-                musicQueues[Context.Guild.Id].Clear();
-                
-            await _lavaNode.LeaveAsync(player.VoiceChannel);
-            
-            await FollowupAsync("👋 Отключился от голосового канала");
+            var player = musicPlayers[Context.Guild.Id];
+            player.Stop();
+            await player.VoiceChannel?.DisconnectAsync();
+
+            await FollowupAsync("👋 Отключился");
         }
 
-        [SlashCommand("help", "Показать список музыкальных команд")]
+        [SlashCommand("help", "Показать команды")]
         public async Task HelpCommand()
         {
             var embed = new EmbedBuilder()
-                .WithTitle("🎵 Music Bot - Все команды")
-                .WithDescription("**Управление музыкой через слеш-команды:**")
+                .WithTitle("🎵 Music Bot - Команды")
+                .WithDescription("**Управление музыкой:**")
                 .WithColor(Color.Purple)
                 .AddField("▶️ **Воспроизведение**", 
-                    "`/play` - Найти и играть трек\n" +
-                    "`/search` - Поиск с выбором\n" +
-                    "`/nowplaying` - Что сейчас играет\n" +
-                    "`/queue` - Показать очередь\n" +
-                    "`/loop` - Повтор трека\n" +
-                    "`/shuffle` - Перемешать очередь\n" +
-                    "`/clear` - Очистить очередь\n" +
-                    "`/remove` - Удалить из очереди", true)
-                .AddField("⏯️ **Управление**", 
-                    "`/pause` - Пауза\n" +
-                    "`/resume` - Продолжить\n" +
+                    "`/play` - Найти и играть\n" +
+                    "`/nowplaying` - Что играет\n" +
+                    "`/queue` - Очередь\n" +
                     "`/skip` - Пропустить\n" +
-                    "`/stop` - Остановить\n" +
-                    "`/seek` - Перемотка\n" +
-                    "`/volume` - Громкость\n" +
-                    "`/leave` - Отключиться", true)
-                .AddField("📋 **Форматы**",
-                    "• Название песни\n" +
-                    "• YouTube ссылка\n" +
-                    "• Spotify ссылка\n" +
-                    "• SoundCloud ссылка", false)
-                .WithFooter($"Серверов: {_client.Guilds.Count} • Хостинг: GitHub Actions")
-                .WithCurrentTimestamp()
+                    "`/stop` - Остановить", true)
+                .AddField("⚙️ **Управление**", 
+                    "`/loop` - Повтор\n" +
+                    "`/shuffle` - Перемешать\n" +
+                    "`/remove` - Удалить из очереди\n" +
+                    "`/clear` - Очистить очередь\n" +
+                    "`/leave` - Отключить", true)
+                .WithFooter("Требуется FFmpeg")
                 .Build();
 
             await RespondAsync(embed: embed, ephemeral: true);
@@ -779,27 +678,24 @@ public class Program
         private string Truncate(string str, int maxLength)
         {
             if (str.Length <= maxLength) return str;
-            return str.Substring(0, maxLength - 3) + "...";
+            return str[..(maxLength - 3)] + "...";
         }
+    }
 
-        private string CreateProgressBar(TimeSpan current, TimeSpan total)
-        {
-            int totalBars = 20;
-            double progress = current.TotalSeconds / total.TotalSeconds;
-            int filledBars = (int)Math.Round(progress * totalBars);
-            
-            string bar = "";
-            for (int i = 0; i < totalBars; i++)
-            {
-                if (i == filledBars)
-                    bar += "🔘";
-                else if (i < filledBars)
-                    bar += "▰";
-                else
-                    bar += "▱";
-            }
-            
-            return bar;
-        }
+    public class VideoSearchResult
+    {
+        public string Title { get; set; } = "";
+        public string Url { get; set; } = "";
+        public string Author { get; set; } = "";
+        public TimeSpan Duration { get; set; }
+        public string Thumbnail { get; set; } = "";
+    }
+
+    private static string FormatDuration(TimeSpan duration)
+    {
+        if (duration.Hours > 0)
+            return $"{duration.Hours}:{duration.Minutes:D2}:{duration.Seconds:D2}";
+        else
+            return $"{duration.Minutes}:{duration.Seconds:D2}";
     }
 }
