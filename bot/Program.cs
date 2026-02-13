@@ -1,4 +1,5 @@
 using Discord;
+using Discord.Audio;
 using Discord.WebSocket;
 using Discord.Interactions;
 using Microsoft.Extensions.DependencyInjection;
@@ -126,26 +127,36 @@ public class Program
     {
         public Queue<SongInfo> Queue { get; set; } = new();
         public bool IsPlaying { get; set; } = false;
-        public bool IsPaused { get; set; } = false;
         public bool Loop { get; set; } = false;
-        public int Volume { get; set; } = 50;
         public IVoiceChannel? VoiceChannel { get; set; }
         public ITextChannel? TextChannel { get; set; }
         public Process? FfmpegProcess { get; set; }
         public IAudioClient? AudioClient { get; set; }
         public SongInfo? CurrentSong { get; set; }
         public CancellationTokenSource? PlaybackCts { get; set; }
+        public Task? PlayingTask { get; set; }
 
         public void Stop()
         {
             IsPlaying = false;
-            IsPaused = false;
             CurrentSong = null;
-            FfmpegProcess?.Kill();
-            FfmpegProcess?.Dispose();
+            
+            try
+            {
+                FfmpegProcess?.Kill();
+                FfmpegProcess?.Dispose();
+            }
+            catch { }
+            
             FfmpegProcess = null;
-            PlaybackCts?.Cancel();
-            PlaybackCts?.Dispose();
+            
+            try
+            {
+                PlaybackCts?.Cancel();
+                PlaybackCts?.Dispose();
+            }
+            catch { }
+            
             PlaybackCts = null;
             Queue.Clear();
         }
@@ -192,47 +203,43 @@ public class Program
             try
             {
                 // Поиск видео
-                VideoSearchResult video;
+                string title, url, author, thumbnail;
+                TimeSpan duration;
+
                 if (Uri.IsWellFormedUriString(query, UriKind.Absolute))
                 {
-                    var v = await youtube.Videos.GetAsync(query);
-                    video = new VideoSearchResult
-                    {
-                        Title = v.Title,
-                        Url = v.Url,
-                        Author = v.Author.ChannelTitle,
-                        Duration = v.Duration ?? TimeSpan.Zero,
-                        Thumbnail = v.Thumbnails.FirstOrDefault()?.Url ?? ""
-                    };
+                    var video = await youtube.Videos.GetAsync(query);
+                    title = video.Title;
+                    url = video.Url;
+                    author = video.Author?.ChannelTitle ?? "Unknown";
+                    duration = video.Duration ?? TimeSpan.Zero;
+                    thumbnail = video.Thumbnails.FirstOrDefault()?.Url ?? "";
                 }
                 else
                 {
                     var results = await youtube.Search.GetVideosAsync(query);
-                    var first = results.FirstOrDefault();
-                    if (first == null)
+                    var firstVideo = results.FirstOrDefault();
+                    if (firstVideo == null)
                     {
                         await FollowupAsync($"❌ Ничего не найдено по запросу: {query}");
                         return;
                     }
                     
-                    var v = await youtube.Videos.GetAsync(first.Url);
-                    video = new VideoSearchResult
-                    {
-                        Title = v.Title,
-                        Url = v.Url,
-                        Author = v.Author.ChannelTitle,
-                        Duration = v.Duration ?? TimeSpan.Zero,
-                        Thumbnail = v.Thumbnails.FirstOrDefault()?.Url ?? ""
-                    };
+                    var video = await youtube.Videos.GetAsync(firstVideo.Url);
+                    title = video.Title;
+                    url = video.Url;
+                    author = video.Author?.ChannelTitle ?? "Unknown";
+                    duration = video.Duration ?? TimeSpan.Zero;
+                    thumbnail = video.Thumbnails.FirstOrDefault()?.Url ?? "";
                 }
 
                 var song = new SongInfo
                 {
-                    Title = video.Title,
-                    Url = video.Url,
-                    Author = video.Author,
-                    Duration = video.Duration,
-                    Thumbnail = video.Thumbnail,
+                    Title = title,
+                    Url = url,
+                    Author = author,
+                    Duration = duration,
+                    Thumbnail = thumbnail,
                     RequestedBy = user.Id
                 };
 
@@ -260,7 +267,8 @@ public class Program
                     
                     await FollowupAsync($"🔍 Подключаюсь и начинаю воспроизведение...");
                     
-                    await PlaySong(player, song);
+                    // Запускаем воспроизведение в фоне
+                    _ = Task.Run(async () => await PlaySong(player, song));
                     
                     var embed = new EmbedBuilder()
                         .WithTitle("🎵 Сейчас играет")
@@ -290,7 +298,8 @@ public class Program
 
                 // Получаем аудио поток
                 var streamManifest = await youtube.Videos.Streams.GetManifestAsync(song.Url);
-                var audioStream = streamManifest.GetAudioOnlyStreams().GetWithHighestBitrate();
+                var audioStream = streamManifest.GetAudioOnlyStreams().TryGetWithHighestBitrate();
+                
                 if (audioStream == null)
                 {
                     await player.TextChannel?.SendMessageAsync("❌ Не удалось получить аудио поток");
@@ -299,7 +308,7 @@ public class Program
                 }
 
                 // Подключаемся к голосовому каналу
-                player.AudioClient = await player.VoiceChannel?.ConnectAsync();
+                player.AudioClient = await player.VoiceChannel.ConnectAsync();
                 
                 // Создаем FFmpeg процесс для конвертации
                 var ffmpeg = Process.Start(new ProcessStartInfo
@@ -351,6 +360,7 @@ public class Program
             {
                 Console.WriteLine($"Error playing: {ex.Message}");
                 player.IsPlaying = false;
+                await HandleTrackEnd(player);
             }
         }
 
@@ -435,29 +445,6 @@ public class Program
             await FollowupAsync("⏹️ Воспроизведение остановлено");
         }
 
-        [SlashCommand("pause", "Поставить на паузу")]
-        public async Task PauseCommand()
-        {
-            await DeferAsync();
-
-            if (!musicPlayers.ContainsKey(Context.Guild.Id))
-            {
-                await FollowupAsync("❌ Нет активного воспроизведения!");
-                return;
-            }
-
-            var player = musicPlayers[Context.Guild.Id];
-            // В этой упрощенной версии пауза не поддерживается
-            await FollowupAsync("⏸️ Функция паузы временно недоступна");
-        }
-
-        [SlashCommand("resume", "Продолжить воспроизведение")]
-        public async Task ResumeCommand()
-        {
-            await DeferAsync();
-            await FollowupAsync("▶️ Функция продолжения временно недоступна");
-        }
-
         [SlashCommand("queue", "Показать очередь")]
         public async Task QueueCommand()
         {
@@ -494,15 +481,14 @@ public class Program
                 .WithTitle("📜 Очередь")
                 .WithDescription(description)
                 .WithColor(Color.Blue)
-                .WithFooter($"Всего треков: {queueList.Count}")
-                .Build();
+                .WithFooter($"Всего треков: {queueList.Count}");
 
             if (player.CurrentSong != null)
             {
                 embed.AddField("Сейчас играет", $"[{player.CurrentSong.Title}]({player.CurrentSong.Url}) [{FormatDuration(player.CurrentSong.Duration)}]");
             }
 
-            await FollowupAsync(embed: embed);
+            await FollowupAsync(embed: embed.Build());
         }
 
         [SlashCommand("nowplaying", "Что сейчас играет")]
@@ -680,15 +666,6 @@ public class Program
             if (str.Length <= maxLength) return str;
             return str[..(maxLength - 3)] + "...";
         }
-    }
-
-    public class VideoSearchResult
-    {
-        public string Title { get; set; } = "";
-        public string Url { get; set; } = "";
-        public string Author { get; set; } = "";
-        public TimeSpan Duration { get; set; }
-        public string Thumbnail { get; set; } = "";
     }
 
     private static string FormatDuration(TimeSpan duration)
