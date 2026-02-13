@@ -16,26 +16,15 @@ jobs:
     - name: 📥 Checkout repository
       uses: actions/checkout@v4
       
-    - name: ⚙️ Setup Java (for Lavalink)
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'temurin'
-        java-version: '17'
-        
-    - name: 📦 Download Lavalink
+    - name: 🎵 Install FFmpeg
       run: |
-        wget -O Lavalink.jar https://github.com/lavalink-devs/Lavalink/releases/download/3.7.10/Lavalink.jar
+        sudo apt update
+        sudo apt install -y ffmpeg
         
     - name: ⚙️ Setup .NET 8
       uses: actions/setup-dotnet@v4
       with:
         dotnet-version: '8.0.x'
-        
-    - name: 🚀 Start Lavalink
-      run: |
-        java -jar Lavalink.jar &
-        echo "Lavalink started"
-        sleep 10
         
     - name: 🔨 Build bot
       run: |
