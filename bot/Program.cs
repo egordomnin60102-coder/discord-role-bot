@@ -6,6 +6,7 @@ using Microsoft.Extensions.DependencyInjection;
 using System.Diagnostics;
 using System.Collections.Concurrent;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 public class Program
 {
@@ -14,6 +15,16 @@ public class Program
     private static IServiceProvider? services;
     private static ConcurrentDictionary<ulong, MusicPlayer> musicPlayers = new();
     private static HttpClient httpClient = new();
+    private static readonly string[] InvidiousInstances = new[]
+    {
+        "https://invidious.projectsegfau.lt",
+        "https://yewtu.be",
+        "https://inv.riverside.rocks",
+        "https://invidious.snopyta.org",
+        "https://vid.puffyan.us",
+        "https://invidious.nerdvpn.de",
+        "https://inv.bp.projectsegfau.lt"
+    };
 
     public static async Task Main(string[] args)
     {
@@ -30,24 +41,8 @@ public class Program
             return;
         }
 
-        // Проверяем наличие yt-dlp
-        try
-        {
-            var check = Process.Start(new ProcessStartInfo
-            {
-                FileName = "yt-dlp",
-                Arguments = "--version",
-                RedirectStandardOutput = true,
-                UseShellExecute = false
-            });
-            await check.WaitForExitAsync();
-            Console.WriteLine($"✅ yt-dlp version: {(await check.StandardOutput.ReadToEndAsync()).Trim()}");
-        }
-        catch
-        {
-            Console.WriteLine("❌ yt-dlp not found! Installing...");
-            Process.Start("pip", "install yt-dlp").WaitForExit();
-        }
+        Console.WriteLine("✅ Token received");
+        Console.WriteLine("🚀 Starting bot...");
 
         services = new ServiceCollection()
             .AddSingleton<DiscordSocketClient>()
@@ -143,7 +138,6 @@ public class Program
         public IVoiceChannel? VoiceChannel { get; set; }
         public ITextChannel? TextChannel { get; set; }
         public Process? FfmpegProcess { get; set; }
-        public Process? YtDlpProcess { get; set; }
         public IAudioClient? AudioClient { get; set; }
         public SongInfo? CurrentSong { get; set; }
         public CancellationTokenSource? PlaybackCts { get; set; }
@@ -160,13 +154,6 @@ public class Program
             }
             catch { }
             
-            try
-            {
-                YtDlpProcess?.Kill();
-                YtDlpProcess?.Dispose();
-            }
-            catch { }
-            
             PlaybackCts?.Cancel();
             PlaybackCts?.Dispose();
             PlaybackCts = null;
@@ -177,7 +164,7 @@ public class Program
     public class SongInfo
     {
         public string Title { get; set; } = "";
-        public string Url { get; set; } = "";
+        public string VideoId { get; set; } = "";
         public string Author { get; set; } = "";
         public TimeSpan Duration { get; set; }
         public string Thumbnail { get; set; } = "";
@@ -215,8 +202,8 @@ public class Program
             {
                 await FollowupAsync($"🔍 Ищу: {query}...");
 
-                // Получаем информацию о видео через yt-dlp
-                var song = await GetVideoInfo(query);
+                // Получаем информацию о видео
+                var song = await SearchVideo(query);
 
                 if (song == null)
                 {
@@ -230,7 +217,7 @@ public class Program
                     
                     var embed = new EmbedBuilder()
                         .WithTitle("➕ Добавлено в очередь")
-                        .WithDescription($"[{song.Title}]({song.Url})")
+                        .WithDescription($"[{song.Title}](https://youtu.be/{song.VideoId})")
                         .WithColor(Color.Blue)
                         .AddField("Автор", song.Author, true)
                         .AddField("Длительность", FormatDuration(song.Duration), true)
@@ -253,11 +240,11 @@ public class Program
                     await ModifyOriginalResponseAsync(msg => msg.Content = $"🔍 Подключаюсь и начинаю воспроизведение...");
                     
                     // Запускаем воспроизведение
-                    _ = Task.Run(async () => await PlaySong(player, song));
+                    _ = Task.Run(async () => await PlaySong(player));
                     
                     var embed = new EmbedBuilder()
-                        .WithTitle("🎵 Сейчас играет")
-                        .WithDescription($"[{song.Title}]({song.Url})")
+                        .WithTitle("🔴 Сейчас играет")
+                        .WithDescription($"[{song.Title}](https://youtu.be/{song.VideoId})")
                         .WithColor(Color.Green)
                         .AddField("Автор", song.Author, true)
                         .AddField("Длительность", FormatDuration(song.Duration), true)
@@ -274,60 +261,87 @@ public class Program
             }
         }
 
-        private async Task<SongInfo?> GetVideoInfo(string query)
+        private async Task<SongInfo?> SearchVideo(string query)
         {
-            try
+            foreach (var instance in InvidiousInstances)
             {
-                // Если это не ссылка, добавляем для поиска
-                if (!Uri.IsWellFormedUriString(query, UriKind.Absolute))
+                try
                 {
-                    query = $"ytsearch1:{query}";
+                    // Извлекаем ID видео если это ссылка
+                    if (Uri.IsWellFormedUriString(query, UriKind.Absolute))
+                    {
+                        var videoId = ExtractVideoId(query);
+                        if (!string.IsNullOrEmpty(videoId))
+                        {
+                            var response = await httpClient.GetStringAsync($"{instance}/api/v1/videos/{videoId}");
+                            var video = JsonDocument.Parse(response).RootElement;
+                            
+                            return new SongInfo
+                            {
+                                Title = video.GetProperty("title").GetString() ?? "Unknown",
+                                Author = video.GetProperty("author").GetString() ?? "Unknown",
+                                Duration = TimeSpan.FromSeconds(video.GetProperty("lengthSeconds").GetInt32()),
+                                Thumbnail = $"https://i.ytimg.com/vi/{videoId}/hqdefault.jpg",
+                                VideoId = videoId,
+                                RequestedBy = Context.User.Id
+                            };
+                        }
+                    }
+
+                    // Поиск по названию
+                    var searchResponse = await httpClient.GetStringAsync($"{instance}/api/v1/search?q={Uri.EscapeDataString(query)}");
+                    var results = JsonDocument.Parse(searchResponse).RootElement;
+                    
+                    if (results.GetArrayLength() > 0)
+                    {
+                        var first = results[0];
+                        var videoId = first.GetProperty("videoId").GetString();
+                        
+                        return new SongInfo
+                        {
+                            Title = first.GetProperty("title").GetString() ?? "Unknown",
+                            Author = first.GetProperty("author").GetString() ?? "Unknown",
+                            Duration = TimeSpan.FromSeconds(first.GetProperty("lengthSeconds").GetInt32()),
+                            Thumbnail = $"https://i.ytimg.com/vi/{videoId}/hqdefault.jpg",
+                            VideoId = videoId ?? "",
+                            RequestedBy = Context.User.Id
+                        };
+                    }
                 }
-
-                // Получаем информацию через yt-dlp
-                var process = Process.Start(new ProcessStartInfo
+                catch
                 {
-                    FileName = "yt-dlp",
-                    Arguments = $"--dump-json --no-playlist \"{query}\"",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                });
-
-                if (process == null) return null;
-
-                var output = await process.StandardOutput.ReadToEndAsync();
-                await process.WaitForExitAsync();
-
-                if (string.IsNullOrEmpty(output)) return null;
-
-                var json = JsonDocument.Parse(output).RootElement;
-                
-                // Парсим длительность
-                var durationStr = json.GetProperty("duration").GetInt32();
-                var duration = TimeSpan.FromSeconds(durationStr);
-
-                return new SongInfo
-                {
-                    Title = json.GetProperty("title").GetString() ?? "Unknown",
-                    Url = json.GetProperty("webpage_url").GetString() ?? query,
-                    Author = json.GetProperty("uploader").GetString() ?? "Unknown",
-                    Duration = duration,
-                    Thumbnail = json.GetProperty("thumbnail").GetString() ?? "",
-                };
+                    continue;
+                }
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error getting video info: {ex.Message}");
-                return null;
-            }
+            
+            return null;
         }
 
-        private async Task PlaySong(MusicPlayer player, SongInfo song)
+        private string? ExtractVideoId(string url)
+        {
+            var patterns = new[]
+            {
+                @"youtube\.com/watch\?v=([^&]+)",
+                @"youtu\.be/([^?]+)",
+                @"youtube\.com/embed/([^?]+)"
+            };
+
+            foreach (var pattern in patterns)
+            {
+                var match = Regex.Match(url, pattern);
+                if (match.Success)
+                    return match.Groups[1].Value;
+            }
+
+            return null;
+        }
+
+        private async Task PlaySong(MusicPlayer player)
         {
             try
             {
+                if (player.CurrentSong == null) return;
+
                 player.IsPlaying = true;
                 player.PlaybackCts = new CancellationTokenSource();
 
@@ -339,32 +353,35 @@ public class Program
                 else
                 {
                     player.IsPlaying = false;
+                    await HandleTrackEnd(player);
                     return;
                 }
 
-                // Запускаем yt-dlp для получения аудио потока
-                player.YtDlpProcess = Process.Start(new ProcessStartInfo
+                // Пробуем разные методы получения аудио
+                string? audioUrl = null;
+                
+                // Метод 1: yt-dlp (самый надежный)
+                audioUrl = await GetAudioUrlWithYtDlp(player.CurrentSong.VideoId);
+                
+                // Метод 2: Invidious (запасной)
+                if (string.IsNullOrEmpty(audioUrl))
                 {
-                    FileName = "yt-dlp",
-                    Arguments = $"-f bestaudio -o - \"{song.Url}\"",
-                    RedirectStandardOutput = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                });
+                    audioUrl = await GetAudioUrlFromInvidious(player.CurrentSong.VideoId);
+                }
 
-                if (player.YtDlpProcess == null)
+                if (string.IsNullOrEmpty(audioUrl))
                 {
-                    await player.TextChannel?.SendMessageAsync("❌ Не удалось запустить yt-dlp");
+                    await player.TextChannel?.SendMessageAsync("❌ Не удалось получить аудио поток для этого видео");
                     player.IsPlaying = false;
+                    await HandleTrackEnd(player);
                     return;
                 }
 
-                // Запускаем FFmpeg для конвертации
+                // Запускаем FFmpeg
                 player.FfmpegProcess = Process.Start(new ProcessStartInfo
                 {
                     FileName = "ffmpeg",
-                    Arguments = $"-i pipe:0 -ac 2 -f s16le -ar 48000 pipe:1",
-                    RedirectStandardInput = true,
+                    Arguments = $"-i \"{audioUrl}\" -ac 2 -f s16le -ar 48000 pipe:1",
                     RedirectStandardOutput = true,
                     UseShellExecute = false,
                     CreateNoWindow = true
@@ -374,28 +391,9 @@ public class Program
                 {
                     await player.TextChannel?.SendMessageAsync("❌ FFmpeg не установлен");
                     player.IsPlaying = false;
+                    await HandleTrackEnd(player);
                     return;
                 }
-
-                // Передаем поток из yt-dlp в FFmpeg
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await player.YtDlpProcess.StandardOutput.BaseStream.CopyToAsync(
-                            player.FfmpegProcess.StandardInput.BaseStream, 
-                            player.PlaybackCts.Token);
-                        player.FfmpegProcess.StandardInput.Close();
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        Console.WriteLine("Streaming cancelled");
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Error streaming: {ex.Message}");
-                    }
-                });
 
                 // Создаем поток для Discord
                 if (player.AudioClient != null)
@@ -413,11 +411,13 @@ public class Program
                     {
                         Console.WriteLine("Playback cancelled");
                     }
+                    finally
+                    {
+                        await discordStream.DisposeAsync();
+                    }
                 }
                 
                 player.IsPlaying = false;
-
-                // После окончания трека
                 await HandleTrackEnd(player);
             }
             catch (Exception ex)
@@ -428,20 +428,96 @@ public class Program
             }
         }
 
+        private async Task<string?> GetAudioUrlWithYtDlp(string videoId)
+        {
+            try
+            {
+                var process = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "yt-dlp",
+                    Arguments = $"-f bestaudio -g \"https://youtu.be/{videoId}\"",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                });
+
+                if (process == null) return null;
+
+                var url = await process.StandardOutput.ReadLineAsync();
+                await process.WaitForExitAsync();
+
+                if (!string.IsNullOrEmpty(url) && url.StartsWith("http"))
+                {
+                    return url;
+                }
+
+                return null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private async Task<string?> GetAudioUrlFromInvidious(string videoId)
+        {
+            foreach (var instance in InvidiousInstances)
+            {
+                try
+                {
+                    var response = await httpClient.GetStringAsync($"{instance}/api/v1/videos/{videoId}");
+                    var video = JsonDocument.Parse(response).RootElement;
+                    
+                    // Ищем аудио потоки в formatStreams
+                    if (video.TryGetProperty("formatStreams", out var formatStreams))
+                    {
+                        foreach (var stream in formatStreams.EnumerateArray())
+                        {
+                            var type = stream.GetProperty("type").GetString() ?? "";
+                            if (type.Contains("audio/mp4") || type.Contains("audio/webm"))
+                            {
+                                return stream.GetProperty("url").GetString();
+                            }
+                        }
+                    }
+
+                    // Ищем в adaptiveFormats
+                    if (video.TryGetProperty("adaptiveFormats", out var adaptiveFormats))
+                    {
+                        foreach (var format in adaptiveFormats.EnumerateArray())
+                        {
+                            var type = format.GetProperty("type").GetString() ?? "";
+                            if (type.Contains("audio/mp4") || type.Contains("audio/webm"))
+                            {
+                                return format.GetProperty("url").GetString();
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    continue;
+                }
+            }
+            
+            return null;
+        }
+
         private async Task HandleTrackEnd(MusicPlayer player)
         {
             if (player.Loop && player.CurrentSong != null)
             {
-                await PlaySong(player, player.CurrentSong);
+                await PlaySong(player);
             }
             else if (player.Queue.Count > 0)
             {
                 player.CurrentSong = player.Queue.Dequeue();
-                await PlaySong(player, player.CurrentSong);
+                await PlaySong(player);
                 
                 var embed = new EmbedBuilder()
-                    .WithTitle("🎵 Сейчас играет")
-                    .WithDescription($"[{player.CurrentSong.Title}]({player.CurrentSong.Url})")
+                    .WithTitle("🔴 Сейчас играет")
+                    .WithDescription($"[{player.CurrentSong.Title}](https://youtu.be/{player.CurrentSong.VideoId})")
                     .WithColor(Color.Green)
                     .AddField("Автор", player.CurrentSong.Author, true)
                     .AddField("Длительность", FormatDuration(player.CurrentSong.Duration), true)
@@ -455,7 +531,7 @@ public class Program
             else
             {
                 if (player.TextChannel != null)
-                    await player.TextChannel.SendMessageAsync("📭 Очередь закончилась!");
+                    await player.TextChannel.SendMessageAsync("📢 Очередь закончилась!");
                     
                 player.CurrentSong = null;
                 
@@ -515,7 +591,7 @@ public class Program
             for (int i = 0; i < Math.Min(queueList.Count, 10); i++)
             {
                 var track = queueList[i];
-                description += $"`{i + 1}.` [{Truncate(track.Title, 50)}]({track.Url}) [{FormatDuration(track.Duration)}]\n";
+                description += $"`{i + 1}.` [{Truncate(track.Title, 50)}](https://youtu.be/{track.VideoId}) [{FormatDuration(track.Duration)}]\n";
             }
 
             if (queueList.Count > 10)
@@ -529,7 +605,7 @@ public class Program
 
             if (player.CurrentSong != null)
             {
-                embed.AddField("Сейчас играет", $"[{player.CurrentSong.Title}]({player.CurrentSong.Url}) [{FormatDuration(player.CurrentSong.Duration)}]");
+                embed.AddField("Сейчас играет", $"[{player.CurrentSong.Title}](https://youtu.be/{player.CurrentSong.VideoId}) [{FormatDuration(player.CurrentSong.Duration)}]");
             }
 
             await FollowupAsync(embed: embed.Build());
@@ -547,8 +623,8 @@ public class Program
             }
 
             var embed = new EmbedBuilder()
-                .WithTitle("🎵 Сейчас играет")
-                .WithDescription($"[{player.CurrentSong.Title}]({player.CurrentSong.Url})")
+                .WithTitle("🔴 Сейчас играет")
+                .WithDescription($"[{player.CurrentSong.Title}](https://youtu.be/{player.CurrentSong.VideoId})")
                 .WithColor(Color.Green)
                 .AddField("Автор", player.CurrentSong.Author, true)
                 .AddField("Длительность", FormatDuration(player.CurrentSong.Duration), true)
@@ -669,7 +745,7 @@ public class Program
                     "`/remove` - Удалить из очереди\n" +
                     "`/clear` - Очистить очередь\n" +
                     "`/leave` - Отключить", true)
-                .WithFooter("Использует yt-dlp")
+                .WithFooter("Использует yt-dlp + Invidious")
                 .Build();
 
             await RespondAsync(embed: embed, ephemeral: true);
