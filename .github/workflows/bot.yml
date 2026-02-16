@@ -20,7 +20,7 @@ jobs:
       run: |
         sudo apt update
         sudo apt install -y ffmpeg python3-pip
-        pip3 install yt-dlp
+        pip3 install --upgrade yt-dlp
         
     - name: ⚙️ Setup .NET 8
       uses: actions/setup-dotnet@v4
